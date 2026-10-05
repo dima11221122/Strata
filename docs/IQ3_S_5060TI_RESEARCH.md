@@ -252,6 +252,8 @@ The first basic comparison used executable `5d183f31cd3b79a5c66b3478175c2a7a8058
 
 Suppressing the outer eight-iteration loop's unroll reduced loaded register use to56/thread in executable `d1fe650fafe3862d0773738f556032d9e3893cf4a714aa87819fa1816e3ba10d`. Its basic rates46.7/47.2/47.5 lost to controls59.0/57.5/59.8 and64.0/63.0/64.8. Both controls retained the prior hashes and draft counts; their speed variation still does not establish identical internal work. Lower register use did not yield a gain, and loop unrolling was restored. This second failed candidate received no full benchmark or regression. The MMA override remains off.
 
+Reducing the existing mapped-copy grid from384 to128 blocks was also retested with20 workers and fetch overlap enabled, while MMA stayed off. The rebuilt executable `fdf4a298d57e798afbd9908d3d0efd8f41471d22c0908a12bf4668a16c13e881` produced basic controls61.6/59.8/60.6 and66.8/66.4/69.1, with candidate63.9/63.3/68.5. Corresponding output hashes and aggregate draft counts matched across all three arms. The candidate's warm pair65.9 lost to the closing control67.75, so the setting remains off and no full benchmark or regression ran. The basic measurements are excluded from the public ledger; neither a GPU-contention cause nor a gain is established.
+
 ### Draft precision
 
 `tools/mtp_pack.py --experts q5_0` and `--experts q8_0`, followed by `tools/mtp_rt.py`, produce optional draft packs. These change the MTP routed experts only. Dense draft weights and the vocabulary subset must remain identical between arms. The main IQ3_S model is unchanged.
