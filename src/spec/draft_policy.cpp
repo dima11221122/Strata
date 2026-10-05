@@ -2,6 +2,9 @@
 #include "strata/spec/draft_policy.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 namespace strata::spec {
 namespace {
@@ -22,7 +25,46 @@ constexpr int kProbes = 3;       // a lookup window size is tried this often bef
 }  // namespace
 
 DraftPolicy::DraftPolicy(int max_t, double margin)
-    : max_t_(std::clamp(max_t, 1, kMaxT)), margin_(margin) {}
+    : max_t_(std::clamp(max_t, 1, kMaxT)), margin_(margin) {
+    const char* adaptive = std::getenv("STRATA_MTP_COST_POLICY");
+    adaptive_mtp_ = adaptive && std::atoi(adaptive) != 0;
+    if (adaptive_mtp_)
+        std::fprintf(stderr, "[mtp-policy] empirical-prefix active=1 probes=3 interval=16 margin=%.3f\n", margin_);
+}
+
+int DraftPolicy::choose_mtp(int cap) {
+    if (!adaptive_mtp_) return cap;
+    cap = std::clamp(cap, 1, max_t_);
+    if (cap <= 1) return cap;
+    const unsigned offer = ++mtp_offers_[cap];
+    // Separate confidence caps: a naturally short offer must not train the reward of
+    // truncating a longer, more confident offer. Measure every arm before selecting.
+    const auto& outcomes = mtp_outcomes_[cap];
+    int probe_t = cap;
+    for (int t = cap - 1; t >= 1; --t)
+        if (outcomes[t].n < outcomes[probe_t].n) probe_t = t;
+    if (outcomes[probe_t].n < kProbes) return probe_t;
+    // Bounded exploration keeps costs and acceptance responsive to changed residency/context.
+    if (offer % 16 == 0) return 1 + (offer / 16) % (unsigned) cap;
+    int best_t = cap;
+    double best = outcomes[cap].tokens / outcomes[cap].ms * (1.0 + margin_);
+    for (int t = 1; t < cap; ++t) {
+        const double rate = outcomes[t].tokens / outcomes[t].ms;
+        if (rate > best) { best = rate; best_t = t; }
+    }
+    return best_t;
+}
+
+void DraftPolicy::observe_mtp(int cap, int t, int accepted, double round_ms) {
+    if (!adaptive_mtp_ || cap <= 1 || cap > max_t_ || t < 1 || t > cap ||
+        accepted < 0 || accepted >= t || !std::isfinite(round_ms) || round_ms <= 0) return;
+    auto& outcome = mtp_outcomes_[cap][t];
+    // Actual committed-token rewards avoid inventing outcomes beyond a truncated prefix.
+    const double got = accepted + 1.0;
+    outcome.tokens = outcome.n ? (1.0 - kTokAlpha) * outcome.tokens + kTokAlpha * got : got;
+    outcome.ms = outcome.n ? (1.0 - kTokAlpha) * outcome.ms + kTokAlpha * round_ms : round_ms;
+    if (outcome.n < 1000000u) ++outcome.n;
+}
 
 int DraftPolicy::bucket(int match) {
     return match < 6 ? 0 : match < 12 ? 1 : match < 24 ? 2 : 3;

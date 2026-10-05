@@ -322,6 +322,14 @@ That comparison completed at 21:10 UTC on the same executable. Mapped publicatio
 
 The engine-only build completed at 21:16 UTC with executable SHA256 `4094725d3f4f14b68a45bb508c0f17f21aaa46a018fb0f107c73d5769e20bd7a`. Basic control/candidate/control replays completed at 21:21 UTC with rates 68.5/66.4/68.9, 68.7/66.8/67.4, and 67.4/65.7/67.3 tokens/s. Their last-two warm means were 67.65/67.10/66.50. Corresponding answer hashes and aggregate draft counts matched, and the candidate activation log confirmed the 16-block grid. The candidate failed the gain threshold, so no full benchmark or regression ran; 384 blocks remain selected. These basic replays are excluded from the public full-run ledger.
 
+### Measured MTP prefix candidate
+
+`STRATA_MTP_COST_POLICY=1` opts into a bounded MTP prefix selector. The existing confidence cutoff remains an upper bound. Actual committed tokens and complete round costs are tracked separately for each original confidence cap and executed width; no acceptance beyond a truncated prefix is inferred. Three initial observations per width alternate by sample count. Every sixteenth eligible offer rotates a width probe; other offers shorten only when the observed tokens/ms ratio beats the full cap by the existing 3% margin. Paired token/cost EMAs use weight 0.05. First, lookup, EOS and terminal incomplete rounds do not train this selector.
+
+The measured round includes admission waiting, verification, commit, next drafting and adaptation joins. The original Q2 MTP chain and original IQ3_S target verification remain in use. Width selection changes catch-up work, expert grouping and residency evolution, so answer identity and speed are unproven. Confidence caps are coarse context groups and the small bootstrap can be noisy. The refined engine-only build completed at 21:35 UTC, SHA256 `c97ba62ddcad39e16aea4f08046550f5fa97dbfc69c9b4f50b78ffc78d92a64a`; scoped review found no remaining issues. A basic control/candidate/control bracket is running. No regression has run for this candidate.
+
+[SpecDec++](https://arxiv.org/abs/2405.19715) motivates adapting candidate length to acceptance and cost, using a trained acceptance head. Selected primary excerpts describe experiments with Llama-2 and two A100-80G GPUs. This empirical local controller does not implement that head or inherit the paper's guarantees or gains. [SpecMoEOff](https://arxiv.org/abs/2508.21706) likewise motivates tuning speculation for offloading hardware and workload; its reported gains do not predict this server's result.
+
 ### Earlier validation
 
 The initial CUDA 13, SM 120 build completed. Of 75 registered CTest cases, 73 passed. `ple_parity` lacked its relative Q2_0 GGUF fixture; `expert_multi_test` requires AVX-512 VNNI/VBMI unavailable on this EPYC. These two failures are reported rather than hidden. The IQ3_S runtime uses the supported AVX2 path.

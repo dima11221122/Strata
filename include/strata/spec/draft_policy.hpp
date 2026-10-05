@@ -12,7 +12,8 @@
 //
 // and takes the lookup window only when its best E/cost beats the MTP's by `margin`. Costs are the measured round
 // times per window size (EMA; sizes not seen yet are scaled from seen ones by a prior shape), so the policy adapts
-// to the machine and the context length. It only chooses which drafts to verify: the output is unchanged.
+// to the machine and the context length. Every emitted token still comes from target verification. Opt-in MTP
+// prefix selection can change width-dependent expert placement and floating-point reductions, and hence answers.
 #pragma once
 
 #include <array>
@@ -35,6 +36,11 @@ public:
     /// After the round: the window it used, the drafts accepted, and the round's time (verify + commit + draft).
     void observe(bool lookup, int t, int accepted, int match, double round_ms);
 
+    /// Default-off MTP prefix probe: choose at most the existing confidence-limited window.
+    int choose_mtp(int cap);
+    /// Learn only the width actually verified, including its complete next-draft round cost.
+    void observe_mtp(int cap, int t, int accepted, double round_ms);
+
     double lookup_rate(int match) const;   // current q for a match length
     double cost_ms(int t) const;           // measured or scaled round time of a window of t tokens
 
@@ -47,6 +53,10 @@ private:
     std::array<double, kMaxT + 1> cost_{}, cost_n_{};      // round ms by window size
     std::array<double, kMaxT + 1> mtp_tok_{}, mtp_n_{};    // tokens committed by MTP windows of that size
     std::array<double, kBuckets> ok_{}, bad_{};            // lookup drafts accepted / windows cut short, decayed
+    struct MtpOutcome { double tokens = 0, ms = 0; unsigned n = 0; };
+    bool adaptive_mtp_ = false;
+    std::array<std::array<MtpOutcome, kMaxT + 1>, kMaxT + 1> mtp_outcomes_{};
+    std::array<unsigned, kMaxT + 1> mtp_offers_{};
 };
 
 }  // namespace strata::spec

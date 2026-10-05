@@ -7171,6 +7171,8 @@ int main(int argc, char** argv) {
                     while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
                 }
                 if (first_window) T = 1;
+                const int mtp_cap = T;
+                if (!first_window) T = policy.choose_mtp(mtp_cap);
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
                 bool from_sfx = false;
@@ -7295,9 +7297,12 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
-                if (timed_round && !eos)
+                if (timed_round && !eos) {
+                    const double round_ms = std::chrono::duration<double, std::milli>(Clock::now() - round0).count();
                     policy.observe(from_sfx, T, a, sfx_match,
-                                   std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+                                   round_ms);
+                    if (!from_sfx && produced_n < max_new) policy.observe_mtp(mtp_cap, T, a, round_ms);
+                }
                 if (eos) { finish = "stop"; break; }
                 if (stop_req.load()) { finish = "cancel"; break; }
                 x = outv[(size_t) a];
@@ -8205,6 +8210,9 @@ int main(int argc, char** argv) {
                 while (T < S_mtp && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
             }
             if (first_window) T = 1;
+            const int mtp_cap = T;
+            const bool mtp_policy_round = rounds > 0 && !first_window;
+            if (use_mtp && mtp_policy_round) T = policy.choose_mtp(mtp_cap);
             bool from_sfx = false;
             int sfx_match = 0;
             if (o.suffix_draft > 0 && !first_window) {
@@ -8302,6 +8310,8 @@ int main(int argc, char** argv) {
             const double round_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
             total_ms += round_ms;
             if (timed_round) policy.observe(from_sfx, T, a, sfx_match, round_ms);
+            if (use_mtp && mtp_policy_round && !from_sfx && (int64_t) produced.size() < o.max_new)
+                policy.observe_mtp(mtp_cap, T, a, round_ms);
             if (rounds % 64 == 0)
                 std::fprintf(stderr, "strata generate: position %lld, %lld tokens, %lld rounds\n", (long long) p,
                              (long long) produced.size(), (long long) rounds);
