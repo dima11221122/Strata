@@ -319,6 +319,7 @@ Verifier::~Verifier() {
     }
     if (cs_) cudaStreamSynchronize(cs_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
+    if (fetch_cs_) cudaStreamSynchronize(fetch_cs_);
     for (auto& e : exec_)
         if (e) cudaGraphExecDestroy(e);
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
@@ -330,10 +331,13 @@ Verifier::~Verifier() {
     if (h_commitb_) cudaFreeHost(h_commitb_);
     if (cs_) cudaStreamDestroy(cs_);
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
+    if (fetch_cs_) cudaStreamDestroy(fetch_cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (commit_done_) cudaEventDestroy(commit_done_);
     if (ev_fork_) cudaEventDestroy(ev_fork_);
     if (ev_join_) cudaEventDestroy(ev_join_);
+    if (ev_fetch_fork_) cudaEventDestroy(ev_fetch_fork_);
+    if (ev_fetch_join_) cudaEventDestroy(ev_fetch_join_);
     if (arena_) cudaFree(arena_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
                      h_flagA_, h_plan_, h_flagB_};
@@ -511,7 +515,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     if (prof_on_) {
         const size_t np = (size_t) g.n_layers * kProfPer + 4;
         if (cudaMalloc((void**) &prof_, np * 8) != cudaSuccess) { prof_on_ = false; prof_ = nullptr; cudaGetLastError(); }
-        else { cudaMemset(prof_, 0, np * 8); prof_h_.assign(np, 0); }
+        else {
+            cudaMemset(prof_, 0, np * 8); prof_h_.assign(np, 0);
+            const char* layer_env = std::getenv("STRATA_LAYER_TIMING");
+            if (prof_tail_only_ && layer_env != nullptr && std::atoi(layer_env) != 0)
+                prof_layer_sum_.assign((size_t) g.n_layers * 6, 0);
+        }
     }
     Bump real;
     real.base = (uint8_t*) arena_;
@@ -533,6 +542,15 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         cudaEventCreateWithFlags(&ev_join_, cudaEventDisableTiming) != cudaSuccess) {
         err = "verify: event create failed";
         return false;
+    }
+    const char* fetch_env = std::getenv("STRATA_VERIFY_FETCH_OVERLAP");
+    if (fetch_env != nullptr && std::atoi(fetch_env) != 0 && strata::kernels::cpu::expert_layout().native) {
+        if (cudaStreamCreateWithFlags(&fetch_cs_, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaEventCreateWithFlags(&ev_fetch_fork_, cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&ev_fetch_join_, cudaEventDisableTiming) != cudaSuccess) {
+            err = "verify: fetch overlap stream/event create failed";
+            return false;
+        }
     }
     // Check whether 100% of experts across [lb_, le_) are resident in this stage's VRAM cache.
     // When true, every layer plans on device and writes directly into parts_ without any CPU doorbells,
@@ -1090,15 +1108,38 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
             }
             stamp(l, 19, grp);
+            const bool fetch_fork = sink_.pcie_mode == 2 && fetch_cs_ != nullptr && (!prof_on_ || prof_tail_only_);
+            auto stage_fetch = [&](cudaStream_t stream) {
+                if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, stream);
+                else wait_flag_ge(m_flagB_, ring, stream);
+                if (sink_.pcie_mode == 2) {
+                    const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+                    uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
+                    fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, stream);
+                    rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), stream);
+                }
+            };
+            if (fetch_fork) {
+                if (cudaEventRecord(ev_fetch_fork_, cs) != cudaSuccess ||
+                    cudaStreamWaitEvent(fetch_cs_, ev_fetch_fork_, 0) != cudaSuccess) {
+                    err = "verify: fetch overlap fork failed";
+                    return false;
+                }
+                stage_fetch(fetch_cs_);
+                if (cudaEventRecord(ev_fetch_join_, fetch_cs_) != cudaSuccess) {
+                    err = "verify: fetch overlap event record failed";
+                    return false;
+                }
+            }
             grouped(p_ptr, p_start, p_counts, 0, hit_out);
             stamp(l, 20, grp);
-            if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
-            else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
-            if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
-                const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
-                uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
-                fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
-                rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
+            if (fetch_fork) {
+                if (cudaStreamWaitEvent(cs, ev_fetch_join_, 0) != cudaSuccess) {
+                    err = "verify: fetch overlap join failed";
+                    return false;
+                }
+            } else {
+                stage_fetch(cs);
             }
             stamp(l, 21, grp);
             // the PCIe share is pcie_frac of the misses: a few groups when the cache is cold, usually none (always none at
@@ -1229,6 +1270,8 @@ std::string Verifier::profile_report() {
                                           "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "", "", ""};
     std::string out = prof_tail_only_ ? " MoE slice (shared overlap preserved):" : "";
     if (prof_tail_only_ && device_plan_) out += " CPU-wait/final-copy intervals unavailable with device plan;";
+    const bool fetch_fork = prof_tail_only_ && sink_.pcie_mode == 2 && fetch_cs_ != nullptr;
+    if (fetch_fork) out += " fetch overlaps resident kernels; waitB measures the remaining join;";
     char b[80];
     double total = 0;
     for (int k = 0; k < 2; ++k) {
@@ -1243,6 +1286,14 @@ std::string Verifier::profile_report() {
     }
     std::snprintf(b, sizeof b, " | total %.2f ms/window over %lld windows", total / 1e6 / (double) prof_windows_, (long long) prof_windows_);
     out += b;
+    for (size_t l = 0; l < prof_layer_sum_.size() / 6; ++l) {
+        out += "\nstrata GPU layer " + std::to_string(l) + " tail us/window:";
+        for (int i = 0; i < 6; ++i) {
+            std::snprintf(b, sizeof b, " %.3f", prof_layer_sum_[l * 6 + i] / 1e3 / (double) prof_windows_);
+            out += b;
+        }
+    }
+    for (double& d : prof_layer_sum_) d = 0;
     for (auto& r : prof_sum_) for (double& d : r) d = 0;
     prof_windows_ = 0;
     return out;
@@ -1417,7 +1468,11 @@ void Verifier::collect_profile() {
     if (prof_tail_only_) {
         for (int64_t l = 0; l < L; ++l) {
             const int kind = is_qsa_layer(g, l) ? 1 : 0;
-            for (int i = 19; i <= 24; ++i) prof_sum_[kind][i] += gap(at(l, i), at(l, i - 1));
+            for (int i = 19; i <= 24; ++i) {
+                const double ns = gap(at(l, i), at(l, i - 1));
+                prof_sum_[kind][i] += ns;
+                if (!prof_layer_sum_.empty()) prof_layer_sum_[(size_t) l * 6 + (size_t) (i - 19)] += ns;
+            }
         }
         ++prof_windows_;
         return;

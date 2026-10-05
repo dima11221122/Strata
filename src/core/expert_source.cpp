@@ -3,6 +3,7 @@
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/core/pcie_reuse.hpp"
+#include "strata/core/pcie_cost.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 
@@ -18,7 +19,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1978,6 +1981,60 @@ namespace {
 // refused at run time rather than written past them.
 constexpr int64_t kMaxWindowEntries = 128;
 static_assert(strata::kernels::cpu::MAXT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
+
+struct PcieCostProfile {
+    int workers = 0, host_works = 0;
+    std::vector<PcieCost> formats;
+};
+
+PcieCostProfile load_pcie_cost_profile() {
+    PcieCostProfile profile;
+    const char* file = std::getenv("STRATA_PCIE_COST_PROFILE");
+    if (file == nullptr || *file == '\0') return profile;
+    std::ifstream input(file);
+    std::string header, line, extra;
+    if (!std::getline(input, line)) {
+        std::fprintf(stderr, "strata: PCIe cost profile unreadable; using configured quota\n");
+        return {};
+    }
+    std::istringstream first(line);
+    if (!(first >> header >> profile.workers >> profile.host_works) || first >> extra ||
+        header != "STRATA_PCIE_COST_V1" || profile.workers < 1 || profile.workers > 4096 ||
+        (profile.host_works != 0 && profile.host_works != 1)) {
+        std::fprintf(stderr, "strata: invalid PCIe cost profile header; using configured quota\n");
+        return {};
+    }
+    while (std::getline(input, line)) {
+        if (line.empty()) continue;
+        PcieCost cost;
+        std::string byte_token;
+        std::istringstream row(line);
+        bool valid = (bool) (row >> cost.gu_type >> cost.down_type >> byte_token);
+        const auto parsed_bytes = std::from_chars(byte_token.data(), byte_token.data() + byte_token.size(), cost.blob_bytes);
+        valid = valid && parsed_bytes.ec == std::errc{} && parsed_bytes.ptr == byte_token.data() + byte_token.size();
+        for (double& v : cost.cpu) valid = valid && (bool) (row >> v) && std::isfinite(v) && v >= 0 && v <= 1e6;
+        for (double& v : cost.resident) valid = valid && (bool) (row >> v) && std::isfinite(v) && v >= 0 && v <= 1e6;
+        for (double& v : cost.fetch) valid = valid && (bool) (row >> v) && std::isfinite(v) && v >= 0 && v <= 1e6;
+        for (double& v : cost.pcie) valid = valid && (bool) (row >> v) && std::isfinite(v) && v >= 0 && v <= 1e6;
+        valid = valid && !(row >> extra) && cost.gu_type > 0 && cost.gu_type < 256 &&
+                cost.down_type > 0 && cost.down_type < 256 && cost.blob_bytes > 0 &&
+                cost.cpu[1] + cost.cpu[2] > 0 && cost.fetch[1] > 0 && profile.formats.size() < 64;
+        for (const auto& old : profile.formats)
+            if (old.gu_type == cost.gu_type && old.down_type == cost.down_type && old.blob_bytes == cost.blob_bytes) valid = false;
+        if (!valid) {
+            std::fprintf(stderr, "strata: invalid PCIe cost profile row; using configured quota\n");
+            return {};
+        }
+        profile.formats.push_back(cost);
+    }
+    if (!input.eof()) {
+        std::fprintf(stderr, "strata: PCIe cost profile read failed; using configured quota\n");
+        return {};
+    }
+    std::fprintf(stderr, "strata: PCIe cost profile loaded: %zu formats, %d workers, host work %d\n",
+                 profile.formats.size(), profile.workers, profile.host_works);
+    return profile;
+}
 }  // namespace
 
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
@@ -2040,20 +2097,37 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             const char* v = std::getenv("STRATA_PCIE_REUSE");
             return v != nullptr && std::atoi(v) != 0;
         }();
+        static const PcieCostProfile cost_profile = load_pcie_cost_profile();
+        const PcieCost* cost = nullptr;
+        if (pcie_ok && native && d.plan->pcie_mode == 2 && d.peer == nullptr && d.remote_count == 0 &&
+            cost_profile.workers == d.pool->workers() && cost_profile.host_works == (int) d.pool->host_works()) {
+            const auto& format = lay.fmt[(size_t) d.layers];
+            for (const auto& candidate : cost_profile.formats)
+                if (candidate.gu_type == (int) format.gu_type && candidate.down_type == (int) format.d_type &&
+                    candidate.blob_bytes == lay.blob_bytes(d.layers)) { cost = &candidate; break; }
+        }
         bool selected[kMaxWindowEntries];
-        if (reuse_policy && m > 0) {
+        if (cost != nullptr || (reuse_policy && m > 0)) {
             int reuse[kMaxWindowEntries] = {};
             bool eligible[kMaxWindowEntries] = {};
+            bool missed[kMaxWindowEntries] = {};
+            int resident_groups = 0, resident_entries = 0;
             for (int q = 0; q < nd; ++q) {
                 const int64_t i0 = distinct[q];
                 const int32_t e = ids[i0];
                 for (int64_t i = i0; i < n; ++i) if (first_of[i] == i0) ++reuse[q];
-                eligible[q] = e >= 0 && e < d.n_expert &&
+                missed[q] = e >= 0 && e < d.n_expert &&
                               d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0 &&
-                              !(d.peer != nullptr && d.peer->has(d.layers, e)) && d.src->pinned(d.layers, e);
+                              !(d.peer != nullptr && d.peer->has(d.layers, e));
+                eligible[q] = missed[q] && d.src->pinned(d.layers, e);
+                if (!missed[q] && e >= 0 && e < d.n_expert) { ++resident_groups; resident_entries += reuse[q]; }
             }
-            const int quota = (int) std::min<int64_t>(64, std::min<int64_t>(m, d.plan->staging_cap));
-            select_pcie_reuse(reuse, eligible, nd, quota, selected);
+            const int quota = (int) std::max<int64_t>(0, std::min<int64_t>(64, std::min<int64_t>(cost ? nmiss : m, d.plan->staging_cap)));
+            if (cost != nullptr) {
+                const char* fork = std::getenv("STRATA_VERIFY_FETCH_OVERLAP");
+                const bool overlap = fork != nullptr && std::atoi(fork) != 0 && std::getenv("STRATA_VERIFY_PROFILE") == nullptr;
+                select_pcie_cost(*cost, reuse, missed, eligible, nd, quota, resident_groups, resident_entries, overlap, selected);
+            } else select_pcie_reuse(reuse, eligible, nd, quota, selected);
         }
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
@@ -2073,7 +2147,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 } else if (d.peer != nullptr && d.peer->has(d.layers, e)) {
                     kd = 2;                        // multi-GPU: the second GPU computes it
                 } else {
-                    if ((reuse_policy ? m > 0 && selected[q] : miss_rank >= nmiss - m) && fetches < P.staging_cap && fetches < 64) {
+                    if ((cost != nullptr ? selected[q] : reuse_policy ? m > 0 && selected[q] : miss_rank >= nmiss - m) && fetches < P.staging_cap && fetches < 64) {
                         const uint8_t* src = d.src->pinned(d.layers, e) ? d.src->blob(d.layers, e) : nullptr;
                         if (src != nullptr) {
                             kd = 1;
@@ -2282,6 +2356,24 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     const auto c4 = std::chrono::steady_clock::now();
     pt("ran");
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    static const bool layer_timing = [] {
+        const char* v = std::getenv("STRATA_LAYER_TIMING");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    if (layer_timing && native && d.layers >= 0 && (size_t) d.layers < lay.fmt.size()) {
+        if (d.diagnostic_layers.size() != lay.fmt.size()) d.diagnostic_layers.resize(lay.fmt.size());
+        auto& timing = d.diagnostic_layers[(size_t) d.layers];
+        timing.cpu_ms += ms(c3, c4);
+        ++timing.calls;
+        timing.cpu_groups += (uint64_t) njobs;
+        for (int j = 0; j < njobs; ++j) timing.cpu_entries += (uint64_t) d.jobs_multi[(size_t) j].nt;
+        if (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap) {
+            const auto& P = *d.plan;
+            timing.resident_groups += (uint64_t) P.counts[0];
+            timing.resident_entries += (uint64_t) P.start[P.counts[0]];
+            timing.fetches += (uint64_t) P.counts[2];
+        }
+    }
     d.ms_plan += ms(c0, c1);
     d.ms_actq += ms(c1, c2);
     d.ms_jobs += ms(c2, c3);

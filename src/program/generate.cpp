@@ -7069,6 +7069,7 @@ int main(int argc, char** argv) {
             drive.d.diagnostic_work_hash = 14695981039346656037ull;
             drive.d.diagnostic_cpu_bytes = 0;
             for (auto& count : drive.d.diagnostic_cpu_nt) count = 0;
+            for (auto& timing : drive.d.diagnostic_layers) timing = {};
             struct DecSnap {
                 double wait, pool, host, plan, actq, jobs, run;
                 double gu, hq, down;
@@ -7280,6 +7281,17 @@ int main(int argc, char** argv) {
                              (long long) dec_width[4], (long long) dec_width[5], (long long) dec_width[6],
                              (long long) dec_width[7], (long long) dec_width[8], (long long) dec_width[0]);
                 if (!pr.empty()) std::fprintf(stderr, "strata decode GPU stages (ms/window):%s\n", pr.c_str());
+                const auto& layout = strata::kernels::cpu::expert_layout();
+                for (size_t l = 0; l < drive.d.diagnostic_layers.size(); ++l) {
+                    const auto& timing = drive.d.diagnostic_layers[l];
+                    if (timing.calls == 0) continue;
+                    const double calls = (double) timing.calls;
+                    std::fprintf(stderr, "strata decode layer %zu type %u/%u bytes %llu calls %llu CPU us %.3f groups %.3f entries %.3f VRAM groups %.3f entries %.3f fetches %.3f\n",
+                                 l, (unsigned) layout.fmt[l].gu_type, (unsigned) layout.fmt[l].d_type,
+                                 (unsigned long long) layout.blob_bytes((int64_t) l), (unsigned long long) timing.calls,
+                                 timing.cpu_ms * 1000.0 / calls, timing.cpu_groups / calls, timing.cpu_entries / calls,
+                                 timing.resident_groups / calls, timing.resident_entries / calls, timing.fetches / calls);
+                }
             }
             if (!cancelled) {
                 // a prompt stopped halfway leaves the session somewhere between two chunks: nothing to continue from

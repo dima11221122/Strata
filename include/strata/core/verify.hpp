@@ -291,6 +291,7 @@ private:
     unsigned long long* prof_ = nullptr;              // device: n_layers * kProfPer + 4 stamps
     std::vector<unsigned long long> prof_h_;
     double prof_sum_[2][kProfPer] = {};   // [GDN / QSA layers][stage]
+    std::vector<double> prof_layer_sum_; // optional tail intervals, six per layer
     int64_t prof_windows_ = 0;
 
     const WeightTable* wt_ = nullptr;
@@ -306,6 +307,8 @@ private:
     cudaStream_t cs_ = nullptr;
     cudaStream_t sh_cs_ = nullptr;
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
+    cudaStream_t fetch_cs_ = nullptr; // STRATA_VERIFY_FETCH_OVERLAP, mapped staging only
+    cudaEvent_t ev_fetch_fork_ = nullptr, ev_fetch_join_ = nullptr;
     cudaGraphExec_t exec_[9] = {};
     cudaGraphExec_t commit_exec_ = nullptr;
 

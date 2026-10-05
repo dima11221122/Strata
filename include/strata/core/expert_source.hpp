@@ -360,6 +360,12 @@ struct ExpertDispatch {
     uint64_t diagnostic_work_hash = 14695981039346656037ull;
     uint64_t diagnostic_cpu_bytes = 0;
     uint64_t diagnostic_cpu_nt[9] = {}; // bucket0: group sizes outside1..8
+    struct LayerTiming {
+        double cpu_ms = 0;
+        uint64_t calls = 0, cpu_groups = 0, cpu_entries = 0;
+        uint64_t resident_groups = 0, resident_entries = 0, fetches = 0;
+    };
+    std::vector<LayerTiming> diagnostic_layers; // STRATA_LAYER_TIMING, request-local
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
     /// which the driver uses to swap the most-routed missing experts into the VRAM tier between rounds.
     std::vector<float> usage;
