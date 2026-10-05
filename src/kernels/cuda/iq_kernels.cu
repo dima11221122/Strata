@@ -2543,8 +2543,21 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
         quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
     } else {
-        swiglu_q8_1_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, grp_start, n_groups,
-                                                                                (int) L.n_ff, hq);
+        unsigned blocks = (unsigned) ((nh + 255) / 256);
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+        static const bool small_grid = env_on("STRATA_IQ_SWIGLU_32");
+        if (small_grid && blocks > 32) {
+            // The existing stride is a whole number of warps: each Q8_1 block
+            // retains its 32 lanes, arithmetic and exclusive output ownership.
+            blocks = 32;
+            static const bool logged = [] {
+                std::fprintf(stderr, "[iq-swiglu-grid] max_blocks=32 threads=256 active=1\n");
+                return true;
+            }();
+            (void) logged;
+        }
+#endif
+        swiglu_q8_1_entries_kernel<<<blocks, 256, 0, s>>>(gate, up, grp_start, n_groups, (int) L.n_ff, hq);
     }
     check("native_expert_grouped/swiglu");
     }
