@@ -1,6 +1,6 @@
 # IQ3_S on a 16 GB RTX 5060 Ti
 
-This fork investigates 90 tokens/s for one request using the original Qwen3.8-Flash-Next IQ3_S weights. The best observed three-prompt median so far is 69.1 tokens/s. The target has not been reached. This document records hypotheses and measurements; it does not promise that this hardware can reach the target.
+This fork investigates 90 tokens/s for one request using the original Qwen3.8-Flash-Next IQ3_S weights. The highest observed three-prompt median so far is 70.2 tokens/s, from an admission-overlap candidate whose gain did not repeat. The target has not been reached. This document records hypotheses and measurements; it does not promise that this hardware can reach the target.
 
 ## Measurement contract
 
@@ -311,6 +311,8 @@ The first basic bracket completed at 20:40 UTC with executable `2b9d09d77c98ade8
 The bounded follow-up publishes a request-local pinned mapped snapshot with the existing `copy_i32_from_mapped` kernel instead of an H2D copy-engine operation. Synchronization finishes the snapshot read before replay or reuse. The fixed admission boundary and eligibility guards remain unchanged. Its engine-only build passed and independent review found no issues.
 
 Executable `ed5736b65f2c365b0f72d5d07f52a12e033305b959605f5035bd0413817b6148` completed the basic bracket at 20:56 UTC. Controls returned 67.3/66.1/67.4 and 66.2/65.9/67.3; candidate 67.7/73.3/68.9 tokens/s. Warm means 66.75/71.10/66.60 cleared the gate, prompting five alternating three-prompt runs. These basic replays do not count as benchmark medians. Repeatable gains and new quality validation remain unproven; regression has not run.
+
+The full alternation completed at 21:04 UTC with control/candidate/control/candidate/control medians 67.3/60.8/62.9/70.2/67.2. Candidate rates were 60.8/59.8/71.3 and 69.3/70.2/80.1. One candidate lost to both neighboring controls; the other won. The gain did not repeat, so fixed-window overlap remains disabled and no regression ran. The five valid full reports are recorded in the public ledger; basic replays and diagnostics remain excluded. A CPU-clock-only component comparison is underway to check publication, readiness and verifier costs without GPU events.
 
 ### Earlier validation
 
