@@ -23,6 +23,7 @@
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/hit_hook.hpp"
+#include "strata/core/staging_cache.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 
 #include <atomic>
@@ -218,6 +219,7 @@ struct GpuPlanSink {
     /// copy engine.  counts[0] = VRAM groups, counts[1] = all entries, counts[2] = PCIe groups.
     unsigned long long* ptr2 = nullptr;
     int32_t* start2 = nullptr;
+    unsigned long long* fetch_dst = nullptr; ///< cap indexed destinations; counts[3] = 1 enables them
     unsigned long long staging = 0;
     int64_t staging_cap = 0;
     int64_t cap = 0;
@@ -229,6 +231,8 @@ struct GpuPlanSink {
     /// kernel reads the mapped arena directly; 2 = a copy kernel stages it inside the graph.  For 1 and 2 `ptr2`
     /// holds the arena's device alias.
     int pcie_mode = 0;
+    bool staging_reuse_allowed = false;    ///< native mode2, one group; dispatch also excludes peer/remote
+    StagingCache staging_cache;
 };
 
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).
@@ -364,6 +368,7 @@ struct ExpertDispatch {
         double cpu_ms = 0;
         uint64_t calls = 0, cpu_groups = 0, cpu_entries = 0;
         uint64_t resident_groups = 0, resident_entries = 0, fetches = 0;
+        uint64_t staging_hits = 0, staging_calls = 0;
     };
     std::vector<LayerTiming> diagnostic_layers; // STRATA_LAYER_TIMING, request-local
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),

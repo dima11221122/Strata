@@ -347,6 +347,10 @@ Verifier::~Verifier() {
 
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
                     const NativeHead* head, int max_t, std::string& err) {
+    sink_.staging_cache.clear();
+    const char* staging_reuse = std::getenv("STRATA_STAGING_REUSE");
+    staging_blobs_ = staging_reuse != nullptr && std::atoi(staging_reuse) == StagingCache::capacity &&
+                     strata::kernels::cpu::expert_layout().native ? StagingCache::capacity : kStagingBlobs;
     g_diag_verifier.store(this);
     diag_verify_fn().store(&diag_active_verifier);
     for (auto& slot : g_live) {
@@ -430,7 +434,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         const int64_t cap = (int64_t) (T * K);
         const int64_t i32 = 4 + (cap + 1) + cap + cap;
         const int64_t ptr_off = (i32 + 1) & ~1ll;
-        plan_i32_ = ptr_off + 4 * cap + (cap + 1) + 1;
+        const int64_t dest_off = (ptr_off + 4 * cap + (cap + 1) + 1) & ~1ll;
+        plan_i32_ = dest_off + 2 * cap;
         if (!mapped((size_t) plan_i32_ * 4 * 2 + 64, (void**) &h_plan_, (void**) &m_plan_)) {
             err = "verify: mapped plan allocation failed";
             return false;
@@ -442,6 +447,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sink_.ptr = (unsigned long long*) (h_plan_ + ptr_off);
         sink_.ptr2 = sink_.ptr + cap;
         sink_.start2 = h_plan_ + ptr_off + 4 * cap;
+        sink_.fetch_dst = (unsigned long long*) (h_plan_ + dest_off);
         sink_.cap = cap;
         sink_.publish = &Verifier::publish_plan;
         sink_.fetch = &Verifier::fetch_dma;
@@ -472,7 +478,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
         plan_ = b.take<int32_t>(2 * ((uint64_t) plan_i32_ + 16));
-        staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob);
+        staging_ = b.take<uint8_t>((uint64_t) staging_blobs_ * strata::kernels::cpu::expert_layout().max_blob);
         hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
         nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
         hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
@@ -526,7 +532,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     real.base = (uint8_t*) arena_;
     carve(real);
     sink_.staging = (unsigned long long) staging_;
-    sink_.staging_cap = kStagingBlobs;
+    sink_.staging_cap = staging_blobs_;
     (void) TS;
     if (cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking) != cudaSuccess) {
         err = "verify: copy stream create failed";
@@ -1078,6 +1084,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const unsigned long long* p_ptr = (const unsigned long long*) (pl + ptr_off);
         const unsigned long long* p_ptr2 = p_ptr + capx;
         const int32_t* p_start2 = pl + ptr_off + 4 * capx;
+        const auto* p_fetch_dst = (const unsigned long long*) (pl + ((ptr_off + 4 * capx + (capx + 1) + 1) & ~1ll));
         float* hit_out = hit_out_ + (size_t) tb * K * N;
         float* parts_out = parts_ + (size_t) tb * K * N;
         const auto& lay = strata::kernels::cpu::expert_layout();
@@ -1113,10 +1120,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, stream);
                 else wait_flag_ge(m_flagB_, ring, stream);
                 if (sink_.pcie_mode == 2) {
-                    const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+                    const int64_t per = G == 2 ? staging_blobs_ / 2 : staging_blobs_;
                     uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
-                    fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, stream);
-                    rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), stream);
+                    fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, stream,
+                                p_fetch_dst, p_counts + 3);
+                    rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), stream,
+                                p_fetch_dst, p_counts + 3);
                 }
             };
             if (fetch_fork) {
@@ -1616,6 +1625,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
             sink_.counts[2] = 0;
+            sink_.counts[3] = 0;
             sink_.start[0] = 0;
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -1710,10 +1720,18 @@ void Verifier::set_plan_slot(int grp) {
     sink_.ptr = (unsigned long long*) (base + ptr_off);
     sink_.ptr2 = sink_.ptr + cap;
     sink_.start2 = base + ptr_off + 4 * cap;
+    sink_.fetch_dst = (unsigned long long*) (base + ((ptr_off + 4 * cap + (cap + 1) + 1) & ~1ll));
     const int G = last_batch_ ? 1 : (groups_[last_t_] > 0 ? groups_[last_t_] : 1);
-    const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+    const int64_t per = G == 2 ? staging_blobs_ / 2 : staging_blobs_;
     sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);
     sink_.staging_cap = per;
+    static const bool reuse = [] {
+        const char* v = std::getenv("STRATA_STAGING_REUSE");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    sink_.staging_reuse_allowed = reuse && G == 1 && sink_.pcie_mode == 2 &&
+                                  strata::kernels::cpu::expert_layout().native;
+    if (reuse && !sink_.staging_reuse_allowed) sink_.staging_cache.clear();
 }
 
 // Flag B only rises: a host function of an earlier layer may run after a later layer already raised it directly.
@@ -2121,6 +2139,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
             sink_.counts[2] = 0;
+            sink_.counts[3] = 0;
             sink_.start[0] = 0;
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -2239,6 +2258,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
             sink_.counts[1] = 0;
             sink_.counts[2] = 0;
             sink_.start[0] = 0;
+            sink_.counts[3] = 0;
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;

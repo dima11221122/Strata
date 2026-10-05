@@ -7286,11 +7286,12 @@ int main(int argc, char** argv) {
                     const auto& timing = drive.d.diagnostic_layers[l];
                     if (timing.calls == 0) continue;
                     const double calls = (double) timing.calls;
-                    std::fprintf(stderr, "strata decode layer %zu type %u/%u bytes %llu calls %llu CPU us %.3f groups %.3f entries %.3f VRAM groups %.3f entries %.3f fetches %.3f\n",
+                    std::fprintf(stderr, "strata decode layer %zu type %u/%u bytes %llu calls %llu CPU us %.3f groups %.3f entries %.3f VRAM groups %.3f entries %.3f fetches %.3f staging hits %.3f active %.3f\n",
                                  l, (unsigned) layout.fmt[l].gu_type, (unsigned) layout.fmt[l].d_type,
                                  (unsigned long long) layout.blob_bytes((int64_t) l), (unsigned long long) timing.calls,
                                  timing.cpu_ms * 1000.0 / calls, timing.cpu_groups / calls, timing.cpu_entries / calls,
-                                 timing.resident_groups / calls, timing.resident_entries / calls, timing.fetches / calls);
+                                 timing.resident_groups / calls, timing.resident_entries / calls, timing.fetches / calls,
+                                 timing.staging_hits / calls, timing.staging_calls / calls);
                 }
             }
             if (!cancelled) {

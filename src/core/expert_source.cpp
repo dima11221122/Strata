@@ -2075,18 +2075,37 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;
     int32_t kind[kMaxWindowEntries];       // per entry: -1 CPU, 0 VRAM, 1 PCIe
+    int staging_hits = 0;
+    bool staging_active = false;
     if (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap) {
+        GpuPlanSink& P = *d.plan;
+        const uint64_t bb = lay.blob_bytes(d.layers);
+        const bool cache_enabled = P.staging_reuse_allowed && native && P.pcie_mode == 2 &&
+                                   P.staging_cap > 0 && P.staging_cap <= StagingCache::capacity && P.fetch_dst != nullptr &&
+                                   d.peer == nullptr && d.remote_count == 0 && d.pcie_num > 0 &&
+                                   bb > 0 && bb <= lay.max_blob && lay.max_blob % 16 == 0;
+        if (cache_enabled) P.staging_cache.begin(d.src, P.staging, lay.max_blob, (int) P.staging_cap);
+        else P.staging_cache.clear();
+        staging_active = cache_enabled;
         int64_t distinct[kMaxWindowEntries], first_of[kMaxWindowEntries];
+        int cached_slot[kMaxWindowEntries];
+        bool protected_slots[StagingCache::capacity] = {};
         int nd = 0, nmiss = 0;
         for (int64_t i = 0; i < n; ++i) {
             first_of[i] = i;
             for (int64_t j = 0; j < i; ++j)
                 if (ids[j] == ids[i]) { first_of[i] = first_of[j]; break; }
             if (first_of[i] == i) {
-                distinct[nd++] = i;
+                distinct[nd] = i;
+                cached_slot[nd] = -1;
                 const int32_t e = ids[i];
                 if (e >= 0 && e < d.n_expert && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0 &&
-                    !(d.peer != nullptr && d.peer->has(d.layers, e))) ++nmiss;
+                    !(d.peer != nullptr && d.peer->has(d.layers, e))) {
+                    if (cache_enabled) cached_slot[nd] = P.staging_cache.find(d.layers, e, bb);
+                    if (cached_slot[nd] >= 0) { protected_slots[cached_slot[nd]] = true; ++staging_hits; }
+                    else ++nmiss;
+                }
+                ++nd;
             }
         }
         const bool pcie_ok = d.pcie_num > 0 && d.src->pcie_layer(d.layers);
@@ -2118,7 +2137,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 for (int64_t i = i0; i < n; ++i) if (first_of[i] == i0) ++reuse[q];
                 missed[q] = e >= 0 && e < d.n_expert &&
                               d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0 &&
-                              !(d.peer != nullptr && d.peer->has(d.layers, e));
+                              cached_slot[q] < 0 && !(d.peer != nullptr && d.peer->has(d.layers, e));
                 eligible[q] = missed[q] && d.src->pinned(d.layers, e);
                 if (!missed[q] && e >= 0 && e < d.n_expert) { ++resident_groups; resident_entries += reuse[q]; }
             }
@@ -2130,7 +2149,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             } else select_pcie_reuse(reuse, eligible, nd, quota, selected);
         }
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
-        GpuPlanSink& P = *d.plan;
         const uint8_t* dma_src[64];
         int64_t pcie_i0[64];
         for (int q = 0; q < nd; ++q) {
@@ -2146,14 +2164,21 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                                                                                  : (size_t) slot * (size_t) d.cache_blob));
                 } else if (d.peer != nullptr && d.peer->has(d.layers, e)) {
                     kd = 2;                        // multi-GPU: the second GPU computes it
+                } else if (cached_slot[q] >= 0) {
+                    kd = 0;
+                    ptr = P.staging + (unsigned long long) cached_slot[q] * lay.max_blob;
                 } else {
                     if ((cost != nullptr ? selected[q] : reuse_policy ? m > 0 && selected[q] : miss_rank >= nmiss - m) && fetches < P.staging_cap && fetches < 64) {
                         const uint8_t* src = d.src->pinned(d.layers, e) ? d.src->blob(d.layers, e) : nullptr;
                         if (src != nullptr) {
-                            kd = 1;
-                            dma_src[fetches] = src;
-                            pcie_i0[fetches] = i0;
-                            ++fetches;
+                            const int stage_slot = cache_enabled ? P.staging_cache.reserve(d.layers, e, bb, protected_slots) : fetches;
+                            if (stage_slot >= 0) {
+                                kd = 1;
+                                if (cache_enabled) P.fetch_dst[fetches] = P.staging + (unsigned long long) stage_slot * lay.max_blob;
+                                dma_src[fetches] = src;
+                                pcie_i0[fetches] = i0;
+                                ++fetches;
+                            }
                         }
                     }
                     ++miss_rank;
@@ -2173,7 +2198,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             ++groups;
         }
         P.start[groups] = entries;
-        const uint64_t bb = lay.blob_bytes(d.layers);
         for (int q = 0; q < fetches; ++q) {       // the PCIe groups: staging slot q, entries after the VRAM ones
             const int64_t i0 = pcie_i0[q];
             P.ptr2[q] = P.pcie_mode != 0 ? (unsigned long long) d.src->device_alias(d.layers, ids[i0])
@@ -2191,6 +2215,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         P.counts[0] = groups;
         P.counts[1] = entries;
         P.counts[2] = fetches;
+        P.counts[3] = cache_enabled ? 1 : 0;
         std::atomic_thread_fence(std::memory_order_seq_cst);
         pt("publish", fetches);
         if (P.publish) P.publish(P.ctx);
@@ -2365,6 +2390,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         auto& timing = d.diagnostic_layers[(size_t) d.layers];
         timing.cpu_ms += ms(c3, c4);
         ++timing.calls;
+        timing.staging_hits += (uint64_t) staging_hits;
+        timing.staging_calls += (uint64_t) staging_active;
         timing.cpu_groups += (uint64_t) njobs;
         for (int j = 0; j < njobs; ++j) timing.cpu_entries += (uint64_t) d.jobs_multi[(size_t) j].nt;
         if (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap) {

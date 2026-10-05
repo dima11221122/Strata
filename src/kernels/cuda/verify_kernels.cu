@@ -269,18 +269,23 @@ __global__ void copy_indexed_kernel(float* __restrict__ dst, const float* __rest
 }
 
 __global__ void fetch_blobs_kernel(const unsigned long long* __restrict__ src, const int32_t* __restrict__ n,
-                                   uint4* __restrict__ dst, long long per) {
+                                   uint4* __restrict__ dst, long long per,
+                                   const unsigned long long* __restrict__ destinations, const int32_t* indexed) {
+    const bool use_destinations = indexed != nullptr && *indexed == 1;
     const long long total = (long long) *n * per;
     for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < total;
          i += (long long) gridDim.x * blockDim.x) {
         const long long k = i / per, off = i - k * per;
-        dst[i] = ((const uint4*) src[k])[off];
+        uint4* target = use_destinations ? (uint4*) destinations[k] : dst + k * per;
+        target[off] = ((const uint4*) src[k])[off];
     }
 }
 
-__global__ void rebase_ptrs_kernel(unsigned long long* ptr, const int32_t* n, unsigned long long base, long long bytes) {
+__global__ void rebase_ptrs_kernel(unsigned long long* ptr, const int32_t* n, unsigned long long base, long long bytes,
+                                  const unsigned long long* destinations, const int32_t* indexed) {
     const int k = threadIdx.x;
-    if (k < *n) ptr[k] = base + (unsigned long long) k * (unsigned long long) bytes;
+    if (k < *n) ptr[k] = indexed != nullptr && *indexed == 1 ? destinations[k]
+                         : base + (unsigned long long) k * (unsigned long long) bytes;
 }
 
 __global__ void add_streams_broadcast_kernel(const float* __restrict__ h, const float* __restrict__ e,
@@ -360,20 +365,32 @@ __global__ void dense_steps_kernel(const int32_t* __restrict__ cells, int n, int
 
 }  // namespace
 
-void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream) {
+void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream,
+                 const unsigned long long* destinations, const int32_t* indexed) {
     if (cap <= 0) return;
     if (blob_bytes % 16 != 0) { std::fprintf(stderr, "fetch_blobs: blob size must be a multiple of 16\n"); std::exit(1); }
     static const unsigned blocks = [] {
         const char* value = std::getenv("STRATA_FETCH_128");
         return value && std::atoi(value) != 0 ? 128u : 384u;
     }();
-    fetch_blobs_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (blob_bytes / 16));
+    fetch_blobs_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (blob_bytes / 16),
+                                                             destinations, indexed);
     check("fetch_blobs");
 }
 
-void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes, void* stream) {
-    rebase_ptrs_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(ptr, n, (unsigned long long) base, (long long) blob_bytes);
+void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream) {
+    fetch_blobs(src, n, dst, blob_bytes, cap, stream, nullptr, nullptr);
+}
+
+void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes, void* stream,
+                 const unsigned long long* destinations, const int32_t* indexed) {
+    rebase_ptrs_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(ptr, n, (unsigned long long) base, (long long) blob_bytes,
+                                                        destinations, indexed);
     check("rebase_ptrs");
+}
+
+void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes, void* stream) {
+    rebase_ptrs(ptr, n, base, blob_bytes, stream, nullptr, nullptr);
 }
 
 void add_streams_broadcast(const float* h, const float* e, float* R, int64_t n_embd, int hc, int n_tok, void* stream) {
@@ -590,6 +607,7 @@ __global__ void __launch_bounds__(kResidentPlanMax) resident_plan_kernel(const i
         counts[0] = groups;
         counts[1] = n;
         counts[2] = 0;
+        counts[3] = 0;
         if (skip != nullptr) {
             __threadfence();
             *skip = ring;

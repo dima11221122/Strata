@@ -2573,6 +2573,121 @@
       ],
       "observed_gpu": "2722 MHz, 13801 MHz, 131.71 W, 180.00 W, 66",
       "clocks_after_load": null
+    },
+    {
+      "candidate": "fetchOverlap20",
+      "started": "2026-10-05T17:02:10.947Z",
+      "completed": "2026-10-05T17:03:45.988Z",
+      "engine_sha256": "eba4b8ea57a65f45ad078bb8850787a28a0ef8c034931d58714c5ed61474b3fd",
+      "model": "IQ3_S",
+      "context_capacity": 65536,
+      "rates_tokens_per_second": [
+        66.2,
+        62.9,
+        75.5
+      ],
+      "median_tokens_per_second": 66.2,
+      "draft_accepted": 936,
+      "draft_total": 1149,
+      "output_sha256": [
+        "746fc5a534fcd3dab4f69af305d491c79ff9d60e9e9ed613661a53f6e490dabf",
+        "2c6647e2ec0cb815cd8577e6703b24ca9087d7245119224a73c911f69a309bc6",
+        "2f707e0fe5635ca12777e286b44a1b36ab71a641aa61a70552bde04dea19acb9"
+      ],
+      "observed_gpu": "2722 MHz, 13801 MHz, 133.39 W, 180.00 W, 66",
+      "clocks_after_load": null
+    },
+    {
+      "candidate": "stagingReuse64",
+      "started": "2026-10-05T17:03:46.387Z",
+      "completed": "2026-10-05T17:05:24.375Z",
+      "engine_sha256": "eba4b8ea57a65f45ad078bb8850787a28a0ef8c034931d58714c5ed61474b3fd",
+      "model": "IQ3_S",
+      "context_capacity": 65536,
+      "rates_tokens_per_second": [
+        63.6,
+        63,
+        76.7
+      ],
+      "median_tokens_per_second": 63.6,
+      "draft_accepted": 925,
+      "draft_total": 1138,
+      "output_sha256": [
+        "7d00ae0bdfe18ee939d08923a88d51c41890a44aaba61ca093649e37e40a588b",
+        "17de6b051662d5845e18bc4bc4e1b283c1ed0d5058e15954a88b5859ad6acab2",
+        "2f707e0fe5635ca12777e286b44a1b36ab71a641aa61a70552bde04dea19acb9"
+      ],
+      "observed_gpu": "2722 MHz, 13801 MHz, 134.37 W, 180.00 W, 68",
+      "clocks_after_load": null
+    },
+    {
+      "candidate": "fetchOverlap20",
+      "started": "2026-10-05T17:05:24.787Z",
+      "completed": "2026-10-05T17:07:05.582Z",
+      "engine_sha256": "eba4b8ea57a65f45ad078bb8850787a28a0ef8c034931d58714c5ed61474b3fd",
+      "model": "IQ3_S",
+      "context_capacity": 65536,
+      "rates_tokens_per_second": [
+        66.8,
+        63.6,
+        75.4
+      ],
+      "median_tokens_per_second": 66.8,
+      "draft_accepted": 936,
+      "draft_total": 1149,
+      "output_sha256": [
+        "746fc5a534fcd3dab4f69af305d491c79ff9d60e9e9ed613661a53f6e490dabf",
+        "2c6647e2ec0cb815cd8577e6703b24ca9087d7245119224a73c911f69a309bc6",
+        "2f707e0fe5635ca12777e286b44a1b36ab71a641aa61a70552bde04dea19acb9"
+      ],
+      "observed_gpu": "2722 MHz, 13801 MHz, 133.46 W, 180.00 W, 67",
+      "clocks_after_load": null
+    },
+    {
+      "candidate": "stagingReuse64",
+      "started": "2026-10-05T17:07:05.974Z",
+      "completed": "2026-10-05T17:08:46.572Z",
+      "engine_sha256": "eba4b8ea57a65f45ad078bb8850787a28a0ef8c034931d58714c5ed61474b3fd",
+      "model": "IQ3_S",
+      "context_capacity": 65536,
+      "rates_tokens_per_second": [
+        65.1,
+        63.5,
+        77.3
+      ],
+      "median_tokens_per_second": 65.1,
+      "draft_accepted": 925,
+      "draft_total": 1138,
+      "output_sha256": [
+        "7d00ae0bdfe18ee939d08923a88d51c41890a44aaba61ca093649e37e40a588b",
+        "17de6b051662d5845e18bc4bc4e1b283c1ed0d5058e15954a88b5859ad6acab2",
+        "2f707e0fe5635ca12777e286b44a1b36ab71a641aa61a70552bde04dea19acb9"
+      ],
+      "observed_gpu": "2722 MHz, 13801 MHz, 135.75 W, 180.00 W, 67",
+      "clocks_after_load": null
+    },
+    {
+      "candidate": "fetchOverlap20",
+      "started": "2026-10-05T17:08:46.958Z",
+      "completed": "2026-10-05T17:10:22.453Z",
+      "engine_sha256": "eba4b8ea57a65f45ad078bb8850787a28a0ef8c034931d58714c5ed61474b3fd",
+      "model": "IQ3_S",
+      "context_capacity": 65536,
+      "rates_tokens_per_second": [
+        64.7,
+        62,
+        73.4
+      ],
+      "median_tokens_per_second": 64.7,
+      "draft_accepted": 936,
+      "draft_total": 1149,
+      "output_sha256": [
+        "746fc5a534fcd3dab4f69af305d491c79ff9d60e9e9ed613661a53f6e490dabf",
+        "2c6647e2ec0cb815cd8577e6703b24ca9087d7245119224a73c911f69a309bc6",
+        "2f707e0fe5635ca12777e286b44a1b36ab71a641aa61a70552bde04dea19acb9"
+      ],
+      "observed_gpu": "2722 MHz, 13801 MHz, 131.01 W, 180.00 W, 66",
+      "clocks_after_load": null
     }
   ]
 }
