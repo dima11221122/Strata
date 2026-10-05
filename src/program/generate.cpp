@@ -7089,6 +7089,8 @@ int main(int argc, char** argv) {
             const auto task_timing0 = pool.native_task_timing();
             const auto host_input0 = ver.host_stage_timing[0], host_ple0 = ver.host_stage_timing[1];
             double dt_run = 0, dt_commit = 0, dt_draft = 0;
+            double dt_apply = 0, dt_adapt_join = 0, dt_apply_max = 0, dt_adapt_join_max = 0;
+            int64_t dec_adapt_joins = 0;
             int64_t dec_windows = 0, dec_T = 0;
             int64_t dec_width[9] = {}; // bucket0 contains widths outside1..8
             const int64_t decode_hits0 = drive.d.cache_hits;
@@ -7128,7 +7130,13 @@ int main(int argc, char** argv) {
                 // #463: the previous adapt round's copies land first - with a non-blocking query, whether a swapped-in
                 // expert ran on the GPU or the CPU (they round differently) depended on the copy's timing
                 // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
+                const Clock::time_point apply0 = dec_timing ? Clock::now() : Clock::time_point{};
                 apply_pending(!adapt_nowait());
+                if (dec_timing) {
+                    const double elapsed = std::chrono::duration<double, std::milli>(Clock::now() - apply0).count();
+                    dt_apply += elapsed;
+                    dt_apply_max = std::max(dt_apply_max, elapsed);
+                }
                 if (hist_n > 0) {
                     // the tails the penalties count over, ONE PER ROW: the tokens the state has consumed, the
                     // fed-back head `x` (it joins `consumed` only after this window commits), then the drafts
@@ -7188,7 +7196,16 @@ int main(int argc, char** argv) {
                     ++dec_windows; dec_T += T;
                     ++dec_width[T >= 1 && T <= 8 ? T : 0];
                 }
-                if (adapt_thr.joinable()) adapt_thr.join();
+                if (adapt_thr.joinable()) {
+                    const Clock::time_point join0 = dec_timing ? Clock::now() : Clock::time_point{};
+                    adapt_thr.join();
+                    if (dec_timing) {
+                        const double elapsed = std::chrono::duration<double, std::milli>(Clock::now() - join0).count();
+                        dt_adapt_join += elapsed;
+                        dt_adapt_join_max = std::max(dt_adapt_join_max, elapsed);
+                        ++dec_adapt_joins;
+                    }
+                }
                 if (!adapt_ok) {
                     std::printf("ERR an adaptive refill failed\n");
                     return 1;
@@ -7223,6 +7240,11 @@ int main(int argc, char** argv) {
                              (d1.actq - ds0.actq) / w, (d1.jobs - ds0.jobs) / w, (d1.run - ds0.run) / w,
                              (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
                               (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L));
+                std::fprintf(stderr, "strata decode adaptation (ms/window): apply-pending %.3f join %.3f other %.3f; "
+                                     "max apply/join %.3f/%.3f ms; joins %lld\n",
+                             dt_apply / w, dt_adapt_join / w,
+                             (decode_ms - dt_run - dt_commit - dt_draft - dt_apply - dt_adapt_join) / w,
+                             dt_apply_max, dt_adapt_join_max, (long long) dec_adapt_joins);
                 const char* host_timing_env = std::getenv("STRATA_HOST_STAGE_TIMING");
                 if (host_timing_env != nullptr && std::atoi(host_timing_env) != 0) {
                     const strata::core::Verifier::HostStageTiming baseline[2] = {host_input0, host_ple0};
