@@ -614,8 +614,11 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             const int align = fused_hq_ && gate_up ? 32 : 1;
             const int64_t rows = pipeline && !gate_up ? (mrows_ / FF) * H : mrows_;
             const int64_t units = rows / align;
-            const int64_t g0 = (units * (int64_t) task / mtasks_) * align;
-            const int64_t g1 = (units * (int64_t) (task + 1) / mtasks_) * align;
+            const bool balanced = mode_ == 5 && !native_gu_bounds_.empty();
+            const int64_t g0 = balanced ? native_gu_bounds_[(size_t) task] :
+                                         (units * (int64_t) task / mtasks_) * align;
+            const int64_t g1 = balanced ? native_gu_bounds_[(size_t) task + 1] :
+                                         (units * (int64_t) (task + 1) / mtasks_) * align;
             for (int64_t r = g0; r < g1;) {
                 const int e = (int) (r / per), r0 = (int) (r % per);
                 const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
@@ -747,8 +750,11 @@ void ExpertPool::run_phase(int mode, int n_tasks) {
             if (mode == 5) {
                 const int align = fused_hq_ ? 32 : 1;
                 const int64_t units = mrows_ / align;
-                const int64_t start = (units * (int64_t) i / mtasks_) * align;
-                const int64_t stop = (units * (int64_t) (i + 1) / mtasks_) * align;
+                const bool balanced = !native_gu_bounds_.empty();
+                const int64_t start = balanced ? native_gu_bounds_[i] :
+                                                (units * (int64_t) i / mtasks_) * align;
+                const int64_t stop = balanced ? native_gu_bounds_[i + 1] :
+                                               (units * (int64_t) (i + 1) / mtasks_) * align;
                 for (int64_t e = start / FF; start < stop && e <= (stop - 1) / FF; ++e) {
                     auto& expert_finish = native_expert_finish_[(size_t) e];
                     expert_finish = std::max(expert_finish, sample.finish_ns);
@@ -920,6 +926,43 @@ void ExpertPool::prepare_packed_jobs(const NativeFmt& f, int n) {
 #endif
 }
 
+void ExpertPool::prepare_gu_task_bounds(const NativeFmt& f, int n) {
+    native_gu_bounds_.clear();
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_POOL_GU_BALANCE");
+        return value != nullptr && std::atoi(value) != 0 && cpu_avx2_ok() && !cpu_avx512_ok() &&
+               std::getenv("STRATA_NO_IQ256") == nullptr && std::getenv("STRATA_IQ_MT_MIN") == nullptr &&
+               std::getenv("STRATA_IQ256_PAIR_SINGLE") == nullptr &&
+               std::getenv("STRATA_IQ256_GATHER") == nullptr && std::getenv("STRATA_IQ_PREFETCH") == nullptr &&
+               std::getenv("STRATA_IQ_PACKED_CACHE_GB") == nullptr;
+    }();
+    if (!enabled || fused_hq_ || n <= 1 || n > kMaxSplitMulti ||
+        f.n_embd != H || f.n_ff != FF) return;
+    // Original GU kernels, EPYC7K62 AVX2 probe, equal row geometry, NT1..4.
+    // Integer tenths of microseconds; these are experimental weights, not portable calibration.
+    static constexpr int cost18[4] = {4408, 4862, 5430, 6347};
+    static constexpr int cost21[4] = {6598, 6381, 7489, 8616};
+    static constexpr int cost22[4] = {2904, 4554, 5236, 5788};
+    const int* costs = f.gu_type == 18 ? cost18 : f.gu_type == 21 ? cost21 :
+                       f.gu_type == 22 ? cost22 : nullptr;
+    if (costs == nullptr) return;
+    int64_t prefix[kMaxSplitMulti + 1]{};
+    for (int e = 0; e < n; ++e) {
+        if (mjobs_[e].nt < 1 || mjobs_[e].nt > 4) return;
+        prefix[e + 1] = prefix[e] + (int64_t) costs[mjobs_[e].nt - 1] * FF;
+    }
+    native_gu_bounds_.resize((size_t) mtasks_ + 1);
+    native_gu_bounds_[0] = 0;
+    int e = 0;
+    for (int task = 1; task < mtasks_; ++task) {
+        const int64_t target = prefix[n] * task / mtasks_;
+        while (e + 1 < n && prefix[e + 1] <= target) ++e;
+        native_gu_bounds_[(size_t) task] = (int64_t) e * FF +
+                                         (target - prefix[e]) / costs[mjobs_[e].nt - 1];
+    }
+    native_gu_bounds_[(size_t) mtasks_] = (int64_t) n * FF;
+}
+
 void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
     if (n <= 0) return;
     static const bool fuse = [] { const char* v = std::getenv("STRATA_POOL_FUSED_HQ"); return v != nullptr && std::atoi(v) != 0; }();
@@ -958,6 +1001,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
             continue;
         }
         const auto a = std::chrono::steady_clock::now();
+        prepare_gu_task_bounds(f, nb);
         run_phase(5, mtasks_);
         const auto b = std::chrono::steady_clock::now();
         if (!fused_hq_)

@@ -247,6 +247,7 @@ private:
         int type = -1;
     };
     void prepare_packed_jobs(const NativeFmt& f, int n);
+    void prepare_gu_task_bounds(const NativeFmt& f, int n);
     std::unordered_map<uint64_t, PackedGuEntry> packed_cache_;
     std::list<uint64_t> packed_lru_;
     const void* packed_source_ = nullptr;
@@ -332,7 +333,8 @@ private:
     // run_split_multi state: mode 3 = gate/up row parts, 4 = down row parts
     ExpertJobMulti* mjobs_ = nullptr;
     int64_t mrows_ = 0;     // rows of the current multi phase across all its experts (n * FF, then n * H)
-    int mtasks_ = 1;        // equal row ranges the phase is cut into
+    int mtasks_ = 1;        // row ranges the phase is cut into
+    std::vector<int64_t> native_gu_bounds_;  // optional measured-cost GU boundaries, published with the phase
     struct SplitBufMulti {
         alignas(64) float ff[MAXT][FF];
         ActQ a2[MAXT];
