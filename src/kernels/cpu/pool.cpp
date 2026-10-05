@@ -932,7 +932,7 @@ void ExpertPool::prepare_gu_task_bounds(const NativeFmt& f, int n) {
         const char* value = std::getenv("STRATA_POOL_GU_BALANCE");
         return value != nullptr && std::atoi(value) != 0 && cpu_avx2_ok() && !cpu_avx512_ok() &&
                std::getenv("STRATA_NO_IQ256") == nullptr && std::getenv("STRATA_IQ_MT_MIN") == nullptr &&
-               std::getenv("STRATA_IQ256_PAIR_SINGLE") == nullptr &&
+               std::getenv("STRATA_IQ256_PAIR_SINGLE") == nullptr && std::getenv("STRATA_IQ_SIGNED_GRID") == nullptr &&
                std::getenv("STRATA_IQ256_GATHER") == nullptr && std::getenv("STRATA_IQ_PREFETCH") == nullptr &&
                std::getenv("STRATA_IQ_PACKED_CACHE_GB") == nullptr;
     }();

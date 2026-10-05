@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -115,6 +116,26 @@ static const bool gather = [] { const char* v = std::getenv("STRATA_IQ256_GATHER
 // Opt-in for AVX2 single-input IQ3_S groups. GCC's paired specialization schedules the
 // same reduction faster on the measured Zen 2 host; the second output is discarded.
 static const bool pair_single = [] { const char* v = std::getenv("STRATA_IQ256_PAIR_SINGLE"); return v != nullptr && std::atoi(v) != 0; }();
+static const bool signed_grid = [] { const char* v = std::getenv("STRATA_IQ_SIGNED_GRID"); return v != nullptr && std::atoi(v) != 0; }();
+
+const std::array<uint32_t, 8192>& iq3s_signed_grid() {
+    // Entered only through the runtime AVX2 dispatch, never by a TU constructor.
+    static const auto table = [] {
+        std::array<uint32_t, 8192> values{};
+        for (unsigned mask = 0; mask < 16; ++mask) for (unsigned grid = 0; grid < 512; ++grid) {
+            uint32_t word = 0;
+            for (unsigned k = 0; k < 4; ++k) {
+                const int magnitude = int((iq3s_grid[grid] >> (8 * k)) & 255u);
+                const int coefficient = (mask & (1u << k)) ? -magnitude : magnitude;
+                word |= uint32_t(uint8_t(coefficient)) << (8 * k);
+            }
+            values[grid | (mask << 9)] = word;
+        }
+        std::fprintf(stderr, "[iq3-signed-grid] type=21 bytes=32768 active=1\n");
+        return values;
+    }();
+    return table;
+}
 
 // ---- per format: one 32-value half (values 64*j + 32*half .. +31) -> grid magnitudes, sign vector, scales
 template <int TY> struct Fmt32;
@@ -209,6 +230,17 @@ template <> struct Fmt32<21> {   // IQ3_S: d, qs[64], qh[8], signs[32], scales[4
         const uint8_t s = b[106 + j];
         sc = sc32(half ? 2 * (s >> 4) + 1 : 2 * (s & 15) + 1);
     }
+    static inline void decode_signed(const uint8_t* b, int j, int half, const uint32_t* table,
+                                     __m256i& qv, __m256i& sc) {
+        const uint8_t* q = b + 2 + 16 * j + 8 * half;
+        const uint32_t h = b[66 + 2 * j + half];
+        const uint32_t signs = u32(b + 74 + 8 * j + 4 * half);
+#define SG3(k) int(table[q[k] | (((h >> k) & 1u) << 8) | (((signs >> (4 * k)) & 15u) << 9)])
+        qv = _mm256_set_epi32(SG3(7), SG3(6), SG3(5), SG3(4), SG3(3), SG3(2), SG3(1), SG3(0));
+#undef SG3
+        const uint8_t s = b[106 + j];
+        sc = sc32(half ? 2 * (s >> 4) + 1 : 2 * (s & 15) + 1);
+    }
 };
 
 template <> struct Fmt32<23> {   // IQ4_XS: d, scales_h, scales_l[4], qs[128] - 136 B, 8 signed sub-scales
@@ -233,8 +265,10 @@ template <> struct Fmt32<23> {   // IQ4_XS: d, scales_h, scales_l[4], qs[128] - 
     }
 };
 
-template <int TY, int NT>
+template <int TY, int NT, bool SIGNED_GRID = false>
 inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
+    const uint32_t* signed_lut = nullptr;
+    if constexpr (SIGNED_GRID) signed_lut = iq3s_signed_grid().data();
     __m256 accf[NT];
     for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
     for (int i = 0; i < nblocks; ++i) {
@@ -245,12 +279,21 @@ inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y,
         for (int j = 0; j < 4; ++j) {
             for (int half = 0; half < 2; ++half) {
                 __m256i g, sgn, sc;
-                Fmt32<TY>::decode(blk, j, half, g, sgn, sc);
+                if constexpr (SIGNED_GRID) {
+                    static_assert(TY == 21);
+                    Fmt32<TY>::decode_signed(blk, j, half, signed_lut, g, sc);
+                } else Fmt32<TY>::decode(blk, j, half, g, sgn, sc);
                 const int off = 64 * j + 32 * half;
                 for (int t = 0; t < NT; ++t) {
                     const __m256i yv = _mm256_loadu_si256((const __m256i*) (y[t][i].qs + off));
-                    const __m256i ys = _mm256_sign_epi8(yv, sgn);
-                    acci[t] = _mm256_add_epi32(acci[t], _mm256_madd_epi16(_mm256_maddubs_epi16(g, ys), sc));
+                    __m256i dot;
+                    if constexpr (SIGNED_GRID) {
+                        // Normal Q8_K quantization uses [-127,127], matching the original dot.
+                        // For raw -128, unsigned abs is 128: this computes the true product,
+                        // whereas the original sign-on-activation path wraps its negation.
+                        dot = _mm256_maddubs_epi16(_mm256_abs_epi8(yv), _mm256_sign_epi8(g, yv));
+                    } else dot = _mm256_maddubs_epi16(g, _mm256_sign_epi8(yv, sgn));
+                    acci[t] = _mm256_add_epi32(acci[t], _mm256_madd_epi16(dot, sc));
                 }
             }
         }
@@ -349,13 +392,13 @@ inline void row_dot_iq2xs(const uint8_t* row, int nblocks, const block_q8_K* con
     for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
 }
 
-template <int TY, int NT>
+template <int TY, int NT, bool SIGNED_GRID = false>
 inline void row_dot_any(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
     if constexpr (TY == 17) row_dot_iq2xs<NT>(row, nblocks, y, res);
-    else                    row_dot<TY, NT>(row, nblocks, y, res);
+    else                    row_dot<TY, NT, SIGNED_GRID>(row, nblocks, y, res);
 }
 
-template <int TY, int NT>
+template <int TY, int NT, bool SIGNED_GRID = false>
 void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, float* const* ff,
              int r0, int r1) {
     const block_q8_K* y[NT];
@@ -363,8 +406,8 @@ void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const voi
     const int nb = n / QK_K;
     float g[NT], u[NT];
     for (int r = r0; r < r1; ++r) {
-        row_dot_any<TY, NT>(blob + (size_t) r * gu_row, nb, y, g);
-        row_dot_any<TY, NT>(blob + up_off + (size_t) r * gu_row, nb, y, u);
+        row_dot_any<TY, NT, SIGNED_GRID>(blob + (size_t) r * gu_row, nb, y, g);
+        row_dot_any<TY, NT, SIGNED_GRID>(blob + up_off + (size_t) r * gu_row, nb, y, u);
         for (int t = 0; t < NT; ++t) ff[t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
     }
 }
@@ -380,18 +423,18 @@ void dot_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act,
     }
 }
 
-template <int TY>
+template <int TY, bool SIGNED_GRID = false>
 void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
                 float* const* ff, int r0, int r1) {
     switch (nt) {
-        case 1: gu_rows<TY, 1>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 2: gu_rows<TY, 2>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 3: gu_rows<TY, 3>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 4: gu_rows<TY, 4>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 5: gu_rows<TY, 5>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 6: gu_rows<TY, 6>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 7: gu_rows<TY, 7>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        default: gu_rows<TY, 8>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 1: gu_rows<TY, 1, SIGNED_GRID>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 2: gu_rows<TY, 2, SIGNED_GRID>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 3: gu_rows<TY, 3, SIGNED_GRID>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 4: gu_rows<TY, 4, SIGNED_GRID>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 5: gu_rows<TY, 5, SIGNED_GRID>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 6: gu_rows<TY, 6, SIGNED_GRID>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 7: gu_rows<TY, 7, SIGNED_GRID>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        default: gu_rows<TY, 8, SIGNED_GRID>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
     }
 }
 
@@ -528,7 +571,9 @@ void iq256_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, 
         case 17: gu_rows_nt<17>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         case 18: gu_rows_nt<18>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         case 21:
-            if (pair_single && nt == 1 && r1 <= 640) {
+            if (signed_grid) {
+                gu_rows_nt<21, true>(nt, blob, gu_row, up_off, n, act, ff, r0, r1);
+            } else if (pair_single && nt == 1 && r1 <= 640) {
                 float unused[640];
                 const void* inputs[2] = {act[0], act[0]};
                 float* outputs[2] = {ff[0], unused};
