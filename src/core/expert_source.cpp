@@ -2,6 +2,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/peer_experts.hpp"
+#include "strata/core/pcie_reuse.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 
@@ -2033,6 +2034,27 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
         const bool pcie_ok = d.pcie_num > 0 && d.src->pcie_layer(d.layers);
         const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
+        // Fiddler's input-count scheduling, opt-in for measurement. Transferring
+        // one reused expert costs the same bytes as one serving a single token.
+        static const bool reuse_policy = [] {
+            const char* v = std::getenv("STRATA_PCIE_REUSE");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        bool selected[kMaxWindowEntries];
+        if (reuse_policy && m > 0) {
+            int reuse[kMaxWindowEntries] = {};
+            bool eligible[kMaxWindowEntries] = {};
+            for (int q = 0; q < nd; ++q) {
+                const int64_t i0 = distinct[q];
+                const int32_t e = ids[i0];
+                for (int64_t i = i0; i < n; ++i) if (first_of[i] == i0) ++reuse[q];
+                eligible[q] = e >= 0 && e < d.n_expert &&
+                              d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0 &&
+                              !(d.peer != nullptr && d.peer->has(d.layers, e)) && d.src->pinned(d.layers, e);
+            }
+            const int quota = (int) std::min<int64_t>(64, std::min<int64_t>(m, d.plan->staging_cap));
+            select_pcie_reuse(reuse, eligible, nd, quota, selected);
+        }
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
         const uint8_t* dma_src[64];
@@ -2051,7 +2073,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 } else if (d.peer != nullptr && d.peer->has(d.layers, e)) {
                     kd = 2;                        // multi-GPU: the second GPU computes it
                 } else {
-                    if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 64) {
+                    if ((reuse_policy ? m > 0 && selected[q] : miss_rank >= nmiss - m) && fetches < P.staging_cap && fetches < 64) {
                         const uint8_t* src = d.src->pinned(d.layers, e) ? d.src->blob(d.layers, e) : nullptr;
                         if (src != nullptr) {
                             kd = 1;

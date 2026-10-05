@@ -13,7 +13,8 @@ Layout: dense tensors (attention, indexer, hyper-connections, shared expert, rou
     q2_0   64-element blocks, grid {-1, 0, 1, 2} x d. The scale is chosen per block to MINIMIZE squared error over
            that grid (the ggml reference sets d = max|w| and never uses the +2 level). Same format as the main
            model's experts, so Strata's CPU VNNI kernel and GPU hit kernel serve it unchanged. ~0.71 GB.
-    q4_0   ggml reference rounding. ~1.42 GB.       q8_0   ggml reference. ~2.67 GB.
+    q4_0   ggml reference rounding. ~1.42 GB.       q5_0   ggml reference. ~1.73 GB.
+    q8_0   ggml reference. ~2.67 GB.
 
 This is round-to-nearest, not GSQ: the plan picks the expert format by MEASURED draft acceptance (P0.3/P6), not
 by this file's reconstruction error, which is reported per tensor only as a sanity check. No model runs here.
@@ -97,6 +98,13 @@ def q4_0(w: np.ndarray) -> np.ndarray:
     return out.reshape(-1)
 
 
+def q5_0(w: np.ndarray) -> np.ndarray:
+    """Use the pinned gguf-py's GGML reference block encoder, preserving row order."""
+    if w.shape[-1] % 32:
+        raise ValueError("Q5_0 rows must contain complete 32-value blocks")
+    return gguf.quantize(w.astype(np.float32), gguf.GGMLQuantizationType.Q5_0).reshape(-1)
+
+
 def q8_0(w: np.ndarray) -> np.ndarray:
     x = w.reshape(-1, 32).astype(np.float32)
     d = np.abs(x).max(axis=1, keepdims=True) / 127.0
@@ -109,6 +117,8 @@ def q8_0(w: np.ndarray) -> np.ndarray:
 
 
 def dequant(kind: str, blob: np.ndarray, n: int) -> np.ndarray:
+    if kind == "q5_0":
+        return gguf.dequantize(blob, gguf.GGMLQuantizationType.Q5_0).reshape(-1)[:n]
     if kind == "q2_0":
         b = blob.reshape(-1, 18)
         d = b[:, :2].copy().view(np.float16).astype(np.float32)
@@ -128,6 +138,7 @@ def dequant(kind: str, blob: np.ndarray, n: int) -> np.ndarray:
 
 QUANT = {"q2_0": (q2_0, gguf.GGMLQuantizationType.Q2_0, 64, 18),
          "q4_0": (q4_0, gguf.GGMLQuantizationType.Q4_0, 32, 18),
+         "q5_0": (q5_0, gguf.GGMLQuantizationType.Q5_0, 32, 22),
          "q8_0": (q8_0, gguf.GGMLQuantizationType.Q8_0, 32, 34)}
 
 

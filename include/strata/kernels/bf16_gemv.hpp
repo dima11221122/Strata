@@ -44,12 +44,15 @@ void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_i
 /// No allocations or synchronization, including when stream is null (the CUDA default stream).
 void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
                          int64_t n_in, int64_t n_out, void* stream);
-/// `ncols` columns at once: x is [ncols][n_in], y is [ncols][n_out]; each column bitwise equal to a
-/// `bf16_gemv_fp32_mmvf` call on it.
+/// `ncols` columns at once: x is [ncols][n_in], y is [ncols][n_out]; by default each column is bitwise equal
+/// to a `bf16_gemv_fp32_mmvf` call on it. See the multi-row experiment below.
 void bf16_gemv_fp32_mmvf_cols(const float* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out, int ncols,
                               void* stream);
 /// bf16_gemv_fp32_mmvf for n_tok (1..8) activation rows x[t * ldx], outputs y[t * ldy + j]; one launch,
-/// the weight read once, every output bit-identical to its own single-row call.
+/// the weight read once, every output bit-identical to its own single-row call by default.
+/// CUDA-only STRATA_BF16_DECODE_TC=1 opts into BF16-rounded activations and FP32 tensor-core accumulation
+/// on SM80+ for aligned weights, 2..8 rows, n_in divisible by16 and <=4096, n_out divisible by16 and >=1024.
+/// This changes arithmetic; ineligible shapes/devices retain the default path. Safe in a captured graph.
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                int64_t n_in, int64_t n_out, int n_tok, void* stream);
 

@@ -2,6 +2,11 @@
 #include "strata/kernels/bf16_bits.hpp"
 
 #include <cuda_runtime.h>
+#if !defined(__HIPCC__)
+#include <cuda_bf16.h>
+#include <mma.h>
+#endif
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -131,6 +136,71 @@ int mmvf_block_size(int64_t n_in) {
     return best;
 }
 
+#if !defined(__HIPCC__)
+// Experimental BF16 activation arithmetic. Eight warps split the input reduction
+// of one output tile; the draft window supplies columns, zero padded to 16. The
+// weights stay BF16 and accumulators FP32. No allocation or host synchronization
+// occurs here, so the call is safe inside a captured verify graph.
+__global__ void bf16_decode_tc_kernel(const float* __restrict__ x, int64_t ldx,
+                                      const uint16_t* __restrict__ w, float* __restrict__ y,
+                                      int64_t ldy, int n_in, int n_out, int n_tok) {
+#if __CUDA_ARCH__ >= 800
+    namespace wm = nvcuda::wmma;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int row = blockIdx.x * 16;
+    __shared__ __align__(32) __nv_bfloat16 inputs[8][256];
+    __shared__ __align__(32) float outputs[8][256];
+    wm::fragment<wm::matrix_a, 16, 16, 16, __nv_bfloat16, wm::row_major> a;
+    wm::fragment<wm::matrix_b, 16, 16, 16, __nv_bfloat16, wm::col_major> b;
+    wm::fragment<wm::accumulator, 16, 16, 16, float> acc;
+    wm::fill_fragment(acc, 0.f);
+    for (int base = warp * 16; base < n_in; base += 128) {
+        for (int i = lane; i < 256; i += 32) {
+            const int token = i / 16, k = i % 16;
+            inputs[warp][i] = __float2bfloat16_rn(token < n_tok ? x[(size_t) token * ldx + base + k] : 0.f);
+        }
+        __syncwarp();
+        wm::load_matrix_sync(a, reinterpret_cast<const __nv_bfloat16*>(w + (size_t) row * n_in + base), n_in);
+        wm::load_matrix_sync(b, inputs[warp], 16);
+        wm::mma_sync(acc, a, b, acc);
+        __syncwarp();  // finish reading the tile before reusing shared inputs
+    }
+    wm::store_matrix_sync(outputs[warp], acc, 16, wm::mem_row_major);
+    __syncthreads();
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) {
+        const int r = i / 16, token = i % 16;
+        if (token < n_tok) {
+            float sum = 0.f;
+            for (int part = 0; part < 8; ++part) sum += outputs[part][i];
+            y[(size_t) token * ldy + row + r] = sum;
+        }
+    }
+#endif
+}
+
+bool decode_tc_enabled() {
+    static const bool requested = [] {
+        const char* v = std::getenv("STRATA_BF16_DECODE_TC");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    if (!requested) return false;
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) return false;
+    static thread_local int checked_device = -1;
+    static thread_local bool enabled = false;
+    if (device != checked_device) {
+        int major = 0;
+        cudaFuncAttributes attributes{};
+        enabled = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess &&
+                  major >= 8 && cudaFuncGetAttributes(&attributes, bf16_decode_tc_kernel) == cudaSuccess &&
+                  attributes.ptxVersion >= 80;
+        // Low-architecture PTX can JIT on a newer GPU, but its guarded body is empty.
+        checked_device = device;
+    }
+    return enabled;
+}
+#endif
+
 }  // namespace
 
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
@@ -140,6 +210,17 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
         w == nullptr || y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
         throw std::invalid_argument("bf16_gemv_fp32_mmvf_multi: 1..8 rows, even n_in/ldx, aligned pointers");
     const cudaStream_t st = (cudaStream_t) stream;
+#if !defined(__HIPCC__)
+    if (decode_tc_enabled() && n_in <= 4096 && n_out >= 1024 && n_in % 16 == 0 && n_out % 16 == 0 &&
+        (reinterpret_cast<uintptr_t>(w) & 31u) == 0) {
+        bf16_decode_tc_kernel<<<(unsigned) (n_out / 16), 256, 0, st>>>(x, ldx, w, y, ldy,
+                                                                         (int) n_in, (int) n_out, n_tok);
+        const cudaError_t result = cudaGetLastError();
+        if (result != cudaSuccess)
+            throw std::runtime_error(std::string("bf16_decode_tc launch: ") + cudaGetErrorString(result));
+        return;
+    }
+#endif
 #define STRATA_MMVF_M(N) case N: \
     if (n_tok <= 4) bf16_f32_mmvf_multi_kernel<N, 4><<<(unsigned) n_out, N, 0, st>>>(x, ldx, w, y, ldy, (int) n_in, n_tok); \
     else bf16_f32_mmvf_multi_kernel<N, 8><<<(unsigned) n_out, N, 0, st>>>(x, ldx, w, y, ldy, (int) n_in, n_tok); break
