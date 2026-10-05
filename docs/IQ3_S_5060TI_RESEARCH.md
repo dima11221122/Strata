@@ -250,6 +250,8 @@ The opt-in path requires a CUDA device of compute capability 8.0 or newer; a low
 
 The first basic comparison used executable `5d183f31cd3b79a5c66b3478175c2a7a805870e4c6f87ca90020b24694a9f1d2`: controls68.7/66.6/66.6 and64.5/64.6/66.7, candidate56.9/62.8/59.8. Both controls had matching output hashes and draft counts; the candidate produced different completions. Loaded PTX/binary versions were120, confirming MMA rather than the fallback, and every observed specialization used208 registers/thread. The candidate lost the basic comparison and remains disabled. No full benchmark, numerical regression or answer-quality regression ran for it; these repeated-prompt measurements are excluded from the three-prompt ledger. High register use motivates a bounded loop-unroll experiment, but does not establish the cause of the slowdown. The90 tokens/s target remains unproven.
 
+Suppressing the outer eight-iteration loop's unroll reduced loaded register use to56/thread in executable `d1fe650fafe3862d0773738f556032d9e3893cf4a714aa87819fa1816e3ba10d`. Its basic rates46.7/47.2/47.5 lost to controls59.0/57.5/59.8 and64.0/63.0/64.8. Both controls retained the prior hashes and draft counts; their speed variation still does not establish identical internal work. Lower register use did not yield a gain, and loop unrolling was restored. This second failed candidate received no full benchmark or regression. The MMA override remains off.
+
 ### Draft precision
 
 `tools/mtp_pack.py --experts q5_0` and `--experts q8_0`, followed by `tools/mtp_rt.py`, produce optional draft packs. These change the MTP routed experts only. Dense draft weights and the vocabulary subset must remain identical between arms. The main IQ3_S model is unchanged.
