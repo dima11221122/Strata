@@ -364,6 +364,8 @@ Regression followed the repeated gain on that executable and fixed-cache configu
 
 A separate follow-up compares fixed 4601 slots against normal automatic sizing with this same 40525-row vocabulary and an explicit unchanged 700 MiB reserve. It asks whether released head memory buys useful expert residency; any combined gain is separate from the vocabulary-only result. Actual native slots and logged allocation size are checked before inference. No lower reserve or confounded manual 4716-slot setting is reused.
 
+The automatic sizing trial allocated **4670 native slots, 8.90 GiB**, versus fixed 4601/8.77 GiB. Its startup log preserved 700 MiB reserved and correctly budgeted another 86 MiB for draft binding. Basic warm means 66.90/69.25/68.25 qualified for a full alternation, which completed at 23:22 UTC with medians **68.8/65.5/69.2/67.1/70.4**. Both automatic-cache candidates lost, so fixed 4601 slots remain selected and no regression followed this failure. Allocation figures are rounded startup logs, not exact byte counters. Additional residency did not produce a repeated complete-decode benefit here, so indexed head reuse for further cache expansion is deferred.
+
 [FR-Spec](https://aclanthology.org/2025.acl-long.198/) motivates frequency-based draft vocabulary reduction with full target verification. Selected method and experimental sections use an independent corpus and different EAGLE/Llama hardware. [SpecVocab](https://arxiv.org/abs/2602.13836) instead trains low-dimensional vocabulary ranking and uses indexed head kernels. Strata already gathers its static head only at startup, so that paper's repeated gathering cost does not apply here. Neither paper's gains predict this server's throughput.
 
 ### Earlier validation
