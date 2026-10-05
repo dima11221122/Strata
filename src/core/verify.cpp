@@ -44,6 +44,7 @@
 #include <thread>
 #include <vector>
 #include <chrono>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -51,7 +52,10 @@
 #include <exception>
 #include <immintrin.h>
 #if defined(__linux__)
+#include <sched.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 namespace strata::core {
@@ -64,6 +68,59 @@ const bool g_host_stage_timing = [] {
     const char* value = std::getenv("STRATA_HOST_STAGE_TIMING");
     return value != nullptr && std::atoi(value) != 0;
 }();
+const bool g_dma_callback_profile = [] {
+    const char* value = std::getenv("STRATA_DMA_CALLBACK_PROFILE");
+    return value != nullptr && std::atoi(value) != 0;
+}();
+// Capture the launch affinity before the inference loop narrows itself to CPU0.
+const int g_dma_callback_cpu = [] {
+#if defined(__linux__)
+    const char* value = std::getenv("STRATA_DMA_CALLBACK_CPU");
+    if (value == nullptr) return -1;
+    char* end = nullptr;
+    errno = 0;
+    const long cpu = std::strtol(value, &end, 10);
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (errno != 0 || end == value || *end != '\0' || cpu < 0 || cpu >= CPU_SETSIZE ||
+        sched_getaffinity(0, sizeof allowed, &allowed) != 0 || !CPU_ISSET((int) cpu, &allowed)) {
+        std::fprintf(stderr, "strata DMA callback: invalid or unavailable CPU selection; affinity unchanged\n");
+        return -1;
+    }
+    return (int) cpu;
+#else
+    return -1;
+#endif
+}();
+void configure_dma_callback_thread() {
+#if defined(__linux__)
+    if (!g_dma_callback_profile && g_dma_callback_cpu < 0) return;
+    thread_local bool reported = false;
+    if (reported) return;
+    reported = true;
+    if (g_dma_callback_cpu >= 0) {
+        cpu_set_t target;
+        CPU_ZERO(&target);
+        CPU_SET(g_dma_callback_cpu, &target);
+        const int result = sched_setaffinity(0, sizeof target, &target);
+        const int error = result == 0 ? 0 : errno;
+        std::fprintf(stderr, "strata DMA callback: affinity target %d result %d errno %d\n",
+                     g_dma_callback_cpu, result, error);
+    }
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    const bool valid = sched_getaffinity(0, sizeof allowed, &allowed) == 0;
+    int count = 0, first = -1, last = -1;
+    if (valid) for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &allowed)) continue;
+        ++count;
+        if (first < 0) first = cpu;
+        last = cpu;
+    }
+    std::fprintf(stderr, "strata DMA callback: tid %ld cpu %d affinity_valid %d allowed %d first %d last %d\n",
+                 (long) syscall(SYS_gettid), sched_getcpu(), (int) valid, count, first, last);
+#endif
+}
 struct HostStageSample {
     Verifier::HostStageTiming& total;
     Clock::time_point start{};
@@ -1763,7 +1820,11 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
     FlagSet& fs = v->flag_sets_[v->cur_layer_ % (sizeof v->flag_sets_ / sizeof v->flag_sets_[0])];
     fs.flag = v->h_flagB_;
     fs.value = want;
-    cudaLaunchHostFunc(v->copy_, [](void* p) { FlagSet* s = (FlagSet*) p; raise_flag(s->flag, s->value); }, &fs);
+    cudaLaunchHostFunc(v->copy_, [](void* p) {
+        configure_dma_callback_thread();
+        FlagSet* s = (FlagSet*) p;
+        raise_flag(s->flag, s->value);
+    }, &fs);
 }
 
 void Verifier::publish_plan(void* ctx) {
