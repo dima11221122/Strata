@@ -214,8 +214,10 @@ public:
     };
     HostStageTiming host_stage_timing[2]; // input/hash/prefetch preparation, then PLE collection
     int64_t windows = 0;
-    /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
-    /// window), as one line; empty when off.
+    /// STRATA_VERIFY_PROFILE=1: full GPU stage times since the last call (ms/window).
+    /// STRATA_VERIFY_TAIL_PROFILE=1: MoE slice only, preserving shared-expert overlap.
+    /// The full profiler takes precedence. Empty when off; split groups are not collected.
+    /// Device planning omits CPU-wait/final-copy intervals; tail copy includes shared-stream join.
     std::string profile_report();
 
 private:
@@ -285,6 +287,7 @@ private:
     static constexpr int kProfPer = 33;              // stamps per layer (32 left the hc-read second
                                       // half's up-stamp at slot 32 = the next layer's slot 0: D8)
     bool prof_on_ = false;
+    bool prof_tail_only_ = false;
     unsigned long long* prof_ = nullptr;              // device: n_layers * kProfPer + 4 stamps
     std::vector<unsigned long long> prof_h_;
     double prof_sum_[2][kProfPer] = {};   // [GDN / QSA layers][stage]

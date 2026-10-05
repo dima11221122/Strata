@@ -505,6 +505,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
 #endif
     }
     prof_on_ = std::getenv("STRATA_VERIFY_PROFILE") != nullptr;
+    const char* tail_env = std::getenv("STRATA_VERIFY_TAIL_PROFILE");
+    prof_tail_only_ = !prof_on_ && tail_env != nullptr && std::atoi(tail_env) != 0;
+    prof_on_ = prof_on_ || prof_tail_only_;
     if (prof_on_) {
         const size_t np = (size_t) g.n_layers * kProfPer + 4;
         if (cudaMalloc((void**) &prof_, np * 8) != cudaSuccess) { prof_on_ = false; prof_ = nullptr; cudaGetLastError(); }
@@ -604,7 +607,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     auto stamp = [&](int64_t l, int i, int grp) {
-        if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs);
+        if (prof_on_ && grp == 0 && (!prof_tail_only_ || (i >= 18 && i <= 24)))
+            gpu_stamp(prof_, (int) (l * kProfPer + i), cs);
         if (trace_m_ != nullptr) gpu_stamp(trace_m_, (int) ((l * kProfPer + i) * 2 + grp), cs);   // #649
     };
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
@@ -733,7 +737,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.eps = EPS; a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC;
                 a.inject_out = inj_out + t * HC; a.mixed = mixed_ + t * N;
             }
-            fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
+            fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, (prof_on_ && !prof_tail_only_ && grp == 0) ? prof_ : nullptr,
                                 (int) (l * kProfPer + (half == 0 ? 27 : 30)));
         };
         gr_read_group(0, pending, inj2_, inj_);
@@ -947,7 +951,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             const char* e = std::getenv("STRATA_SH_STREAM");
             return !e || e[0] != '0';
         }();
-        const bool sh_fork = sh_stream_env && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr;
+        const bool sh_fork = sh_stream_env && (!prof_on_ || prof_tail_only_) && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr;
         cudaStream_t sh_stream = sh_fork ? sh_cs_ : cs;
         if (sh_fork) {
             cudaEventRecord(ev_fork_, cs);
@@ -1118,7 +1122,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
             moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
         }
-        if (!prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr) {
+        if ((!prof_on_ || prof_tail_only_) && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr) {
             cudaStreamWaitEvent(cs, ev_join_, 0);
         }
         if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
@@ -1223,7 +1227,8 @@ std::string Verifier::profile_report() {
                                           "attention", "gate", "", "out-proj", "hc-read1+router", "shared+quant",
                                           "waitA", "VRAM hits", "waitB", "PCIe grp", "waitCPU", "copy+combine",
                                           "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "", "", ""};
-    std::string out;
+    std::string out = prof_tail_only_ ? " MoE slice (shared overlap preserved):" : "";
+    if (prof_tail_only_ && device_plan_) out += " CPU-wait/final-copy intervals unavailable with device plan;";
     char b[80];
     double total = 0;
     for (int k = 0; k < 2; ++k) {
@@ -1231,7 +1236,8 @@ std::string Verifier::profile_report() {
         for (int i = 0; i < kProfPer; ++i) {
             if (prof_sum_[k][i] <= 0) continue;
             total += prof_sum_[k][i];
-            std::snprintf(b, sizeof b, " %s %.2f", names[i], prof_sum_[k][i] / 1e6 / (double) prof_windows_);
+            const char* name = prof_tail_only_ && i == 24 ? "copy+shared-join+combine" : names[i];
+            std::snprintf(b, sizeof b, " %s %.2f", name, prof_sum_[k][i] / 1e6 / (double) prof_windows_);
             out += b;
         }
     }
@@ -1408,6 +1414,14 @@ void Verifier::collect_profile() {
     const auto gap = [](unsigned long long to, unsigned long long from) {
         return (from != 0 && to != 0 && to >= from) ? (double) (to - from) : 0.0;
     };
+    if (prof_tail_only_) {
+        for (int64_t l = 0; l < L; ++l) {
+            const int kind = is_qsa_layer(g, l) ? 1 : 0;
+            for (int i = 19; i <= 24; ++i) prof_sum_[kind][i] += gap(at(l, i), at(l, i - 1));
+        }
+        ++prof_windows_;
+        return;
+    }
     for (int64_t l = 0; l < L; ++l) {
         const int kind = is_qsa_layer(g, l) ? 1 : 0;
         unsigned long long prev = at(l, 0);

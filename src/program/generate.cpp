@@ -7065,6 +7065,7 @@ int main(int argc, char** argv) {
             const Clock::time_point d0 = Clock::now();
             // STRATA_DECODE_TIMING=1: where a request's decode time goes (summaries per request)
             static const bool dec_timing = std::getenv("STRATA_DECODE_TIMING") != nullptr;
+            if (dec_timing) (void) ver.profile_report(); // discard prompt/replay stamps before decode snapshots
             drive.d.diagnostic_work_hash = 14695981039346656037ull;
             drive.d.diagnostic_cpu_bytes = 0;
             for (auto& count : drive.d.diagnostic_cpu_nt) count = 0;
