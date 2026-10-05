@@ -370,6 +370,13 @@ void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, 
     if (cap <= 0) return;
     if (blob_bytes % 16 != 0) { std::fprintf(stderr, "fetch_blobs: blob size must be a multiple of 16\n"); std::exit(1); }
     static const unsigned blocks = [] {
+        // A bounded concurrent-fetch probe: fewer CTAs than this server's 36 SMs.
+        // The grid-stride loop still copies every original vector exactly once.
+        const char* limited = std::getenv("STRATA_FETCH_16");
+        if (limited && std::atoi(limited) != 0) {
+            std::fprintf(stderr, "[fetch-grid] blocks=16 threads=256 active=1\n");
+            return 16u;
+        }
         const char* value = std::getenv("STRATA_FETCH_128");
         return value && std::atoi(value) != 0 ? 128u : 384u;
     }();

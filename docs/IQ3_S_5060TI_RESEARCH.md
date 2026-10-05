@@ -314,6 +314,14 @@ Executable `ed5736b65f2c365b0f72d5d07f52a12e033305b959605f5035bd0413817b6148` co
 
 The full alternation completed at 21:04 UTC with control/candidate/control/candidate/control medians 67.3/60.8/62.9/70.2/67.2. Candidate rates were 60.8/59.8/71.3 and 69.3/70.2/80.1. One candidate lost to both neighboring controls; the other won. The gain did not repeat, so fixed-window overlap remains disabled and no regression ran. The five valid full reports are recorded in the public ledger; basic replays and diagnostics remain excluded. A CPU-clock-only component comparison is underway to check publication, readiness and verifier costs without GPU events.
 
+That comparison completed at 21:10 UTC on the same executable. Mapped publication cost 0.296/0.295/0.298 ms/window and delayed readiness 0.001 in all three requests; immediate-admission controls still waited 2.849–3.042 ms/window for readiness. Candidate verifier time was 31.35/29.17/30.16 ms/window. Placement, routed work and speculative widths changed, so these counters do not isolate PCIe contention or explain the full-run variance. They confirm that mapped publication removed most of the earlier table-copy wait. In the older retained hardware trace, ordinary mapped int32 plan copies total only 0.290 ms/decode window, including draft/commit copies, so changing those globally has little measured upside.
+
+### Sixteen-block fetch probe
+
+`STRATA_FETCH_16=1` is a default-off diagnostic alternative to the retained 384-block mapped-fetch grid. It selects 16 blocks of 256 threads; the existing grid-stride loop preserves complete, exclusive coverage of the original 16-byte vectors. Unlike the failed 128-block probe, this grid has fewer blocks than the GPU's 36 SMs. That bounds the launch footprint but does not prove occupancy, contention, or an exposed speed benefit.
+
+The engine-only build completed at 21:16 UTC with executable SHA256 `4094725d3f4f14b68a45bb508c0f17f21aaa46a018fb0f107c73d5769e20bd7a`. Basic control/candidate/control replays completed at 21:21 UTC with rates 68.5/66.4/68.9, 68.7/66.8/67.4, and 67.4/65.7/67.3 tokens/s. Their last-two warm means were 67.65/67.10/66.50. Corresponding answer hashes and aggregate draft counts matched, and the candidate activation log confirmed the 16-block grid. The candidate failed the gain threshold, so no full benchmark or regression ran; 384 blocks remain selected. These basic replays are excluded from the public full-run ledger.
+
 ### Earlier validation
 
 The initial CUDA 13, SM 120 build completed. Of 75 registered CTest cases, 73 passed. `ple_parity` lacked its relative Q2_0 GGUF fixture; `expert_multi_test` requires AVX-512 VNNI/VBMI unavailable on this EPYC. These two failures are reported rather than hidden. The IQ3_S runtime uses the supported AVX2 path.
