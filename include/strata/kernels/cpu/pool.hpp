@@ -31,6 +31,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 
 #include <atomic>
+#include <array>
 #include <cstdio>
 #include <memory>
 #include <chrono>
@@ -172,10 +173,13 @@ public:
     void run_split_multi(ExpertJobMulti* jobs, int n);
     /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
     /// STRATA_POOL_TASKS_PER_THREAD=1..12 overrides the default3 row-task count per thread.
+    /// STRATA_POOL_EXPERT_PIPELINE=1 joins GU/quant/down per expert in one batch;
+    /// it applies only with multiple native experts and fused HQ disabled.
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
     static constexpr int kMaxSplitMulti = 96;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
+    double ms_multi_pipeline = 0; // combined overlapped GU/quant/down, opt-in
     int64_t multi_bytes = 0;
 
     /// Total `_mm_pause` iterations spent waiting, over all workers, is no longer counted - see the note on the
@@ -206,6 +210,7 @@ public:
 
     struct NativeTaskTiming {
         double tail_ms[2] = {}; // latest minus median active worker finish, GU/down
+        double gu_expert_mean_headroom_ms = 0, gu_expert_max_headroom_ms = 0;
         double sample_wall_ms = 0, sample_cpu_ms = 0;
         uint64_t samples = 0;
         double task_wall_ms[9] = {}; // indexed by largest input group in the row task
@@ -227,6 +232,12 @@ public:
     static constexpr std::chrono::seconds kStall{60};
 
 private:
+    struct alignas(64) NativePipelineState {
+        std::atomic<int> gu_rows{0};
+        std::atomic<bool> ready{false};
+    };
+    std::array<NativePipelineState, kMaxSplitMulti> native_pipeline_;
+    void wait_native_expert(int expert);
     bool fused_hq_ = false;  ///< opt-in IQ4_NL activation quantization in the gate/up tasks
     struct PackedGuEntry {
         std::unique_ptr<uint8_t[]> data;
@@ -275,6 +286,7 @@ private:
     };
     std::vector<NativeTaskSample> native_task_samples_; // one writer per claimed task, before done
     std::vector<int64_t> native_worker_finish_;        // host-only scratch, after completion
+    std::vector<int64_t> native_expert_finish_;        // last GU row-task finish for each expert
     NativeTaskTiming native_task_timing_;
     // ---- EACH ATOMIC GETS ITS OWN CACHE LINE, AND THE SPIN COUNTER IS GONE.  (Review finding C3.)
     //
@@ -308,7 +320,7 @@ private:
     std::chrono::microseconds spin_before_sleep_{kSpinBeforeSleep};
     std::vector<std::thread> threads_;
     std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data
-    // run_split state: mode 0 = whole experts, 1 = gate/up row parts, 2 = down row parts
+    // run_split state:0 whole experts,1/2 GU/down;7 native GU then dependent down tasks
     int mode_ = 0;
     int parts_a_ = 1, parts_b_ = 1;
     struct SplitBuf {

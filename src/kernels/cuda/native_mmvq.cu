@@ -1553,6 +1553,17 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(y);
     validate_stream(stream);
     STRATA_WAVE_MMVQ(Q6KTraits)
+    static const bool single_rowwarp = [] {
+        const char* value = std::getenv("STRATA_Q6_ROW_WARP_SINGLE");
+        return value && std::atoi(value) != 0;
+    }();
+    if (ncols == 1 && single_rowwarp) {
+        const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+        native_q6_k_rowwarp_kernel<1><<<blocks, dim3(WARP, WARPS), 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<const Q6KBlock*>(weights), static_cast<const Q81Block*>(x_q8_1), y, n_in, n_out);
+        launch_check();
+        return;
+    }
     if (ncols > 1) {
         launch_multi<Q6KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         launch_check();

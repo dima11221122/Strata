@@ -558,6 +558,22 @@ void ExpertPool::wait_done(int n) {
     }
 }
 
+void ExpertPool::wait_native_expert(int expert) {
+    auto& ready = native_pipeline_[(size_t) expert].ready;
+    if (ready.load(std::memory_order_acquire)) return;
+    const auto start = std::chrono::steady_clock::now();
+    uint32_t spins = 0;
+    while (!ready.load(std::memory_order_acquire)) {
+        _mm_pause();
+        if (++spins % 1024 == 0 && std::chrono::steady_clock::now() - start > kStall) {
+            std::fprintf(stderr, "strata: native CPU expert %d stalled before down rows - stopping the engine\n", expert);
+            strata::core::release_gpu_waits(stderr);
+            std::fflush(stderr);
+            std::abort();
+        }
+    }
+}
+
 void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     (void) id;
     for (;;) {
@@ -566,7 +582,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
         const uint32_t i = (uint32_t) ci;
         if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);
         else { hstate_.store(ci, std::memory_order_relaxed); hstate_ms_.store(now_ms(), std::memory_order_relaxed); }
-        const bool timed = mode_ >= 5 && native_phase_timing_enabled();
+        const bool timed = (mode_ == 5 || mode_ == 6) && native_phase_timing_enabled();
         const auto task_start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const double cpu_start = timed && i % 16 == 0 ? task_thread_cpu_ms() : -1;
         int max_nt = 0;
@@ -582,18 +598,23 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             const int r0 = H * part / parts_b_, r1 = H * (part + 1) / parts_b_;
             s2_expert_down_rows(jobs_[e].blob, split_[(size_t) e].a2, jobs_[e].out, r0, r1);
         } else if (mode_ >= 5) {
-            // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows
-            const int per = mode_ == 5 ? FF : H;
-            const int align = fused_hq_ && mode_ == 5 ? 32 : 1;
-            const int64_t units = mrows_ / align;
-            const int64_t g0 = (units * (int64_t) i / mtasks_) * align;
-            const int64_t g1 = (units * (int64_t) (i + 1) / mtasks_) * align;
+            // Native layers:5 GU,6 down;7 claims all GU tasks before dependent down tasks.
+            const bool pipeline = mode_ == 7;
+            const bool gate_up = mode_ == 5 || (pipeline && (int) i < mtasks_);
+            const int task = pipeline && !gate_up ? (int) i - mtasks_ : (int) i;
+            const int per = gate_up ? FF : H;
+            const int align = fused_hq_ && gate_up ? 32 : 1;
+            const int64_t rows = pipeline && !gate_up ? (mrows_ / FF) * H : mrows_;
+            const int64_t units = rows / align;
+            const int64_t g0 = (units * (int64_t) task / mtasks_) * align;
+            const int64_t g1 = (units * (int64_t) (task + 1) / mtasks_) * align;
             for (int64_t r = g0; r < g1;) {
                 const int e = (int) (r / per), r0 = (int) (r % per);
                 const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
                 SplitBufMulti& sb = split_multi_[(size_t) e];
                 if (timed) max_nt = std::max(max_nt, mjobs_[e].nt);
-                if (mode_ == 5 && q2_native_kernels(nfmt_->gu_type)) {
+                if (pipeline && !gate_up) wait_native_expert(e);
+                if (gate_up && q2_native_kernels(nfmt_->gu_type)) {
                     // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
                     thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
                     float* gp[MAXT];
@@ -605,7 +626,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                     for (int t = 0; t < mjobs_[e].nt; ++t)
                         for (int r = r0; r < r1; ++r)
                             sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
-                } else if (mode_ == 5) {
+                } else if (gate_up) {
                     float* ff[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
 #if defined(STRATA_NATIVE_EXPERTS)
@@ -629,9 +650,17 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                     for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
                     native_down_rows(*nfmt_, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
                 }
-                if (mode_ == 5 && fused_hq_)
+                if (gate_up && fused_hq_)
                     for (int t = 0; t < mjobs_[e].nt; ++t)
                         native_quant_h_rows(*nfmt_, sb.ff[t], sb.hq[t], r0, r1);
+                if (pipeline && gate_up &&
+                    native_pipeline_[(size_t) e].gu_rows.fetch_sub(r1 - r0, std::memory_order_acq_rel) == r1 - r0) {
+                    // The acquire/release decrement chain joins every disjoint GU writer.
+                    for (int t = 0; t < mjobs_[e].nt; ++t)
+                        if (q2_native_kernels(nfmt_->d_type)) act_quant_any(sb.ff[t], FF, sb.a2[t]);
+                        else native_quant_h(*nfmt_, sb.ff[t], sb.hq[t]);
+                    native_pipeline_[(size_t) e].ready.store(true, std::memory_order_release);
+                }
                 r += r1 - r0;
             }
         } else {
@@ -675,6 +704,7 @@ void ExpertPool::run_phase(int mode, int n_tasks) {
     if (timed) {
         native_task_samples_.resize((size_t) n_tasks);
         native_worker_finish_.assign((size_t) n_ + 1, 0);
+        if (mode == 5) native_expert_finish_.assign((size_t) (mrows_ / FF), 0);
     }
     const auto b = timed ? std::chrono::steady_clock::now() : a;
     mode_ = mode;
@@ -692,7 +722,8 @@ void ExpertPool::run_phase(int mode, int n_tasks) {
         ms_native_repark_ += std::chrono::duration<double, std::milli>(d - c).count();
         // Every sample is written before its task's release increment of done_.
         // Late sleepers that cannot claim this epoch never touch the sample array.
-        for (const auto& sample : native_task_samples_) {
+        for (size_t i = 0; i < native_task_samples_.size(); ++i) {
+            const auto& sample = native_task_samples_[i];
             auto& finish = native_worker_finish_[(size_t) sample.worker];
             finish = std::max(finish, sample.finish_ns);
             native_task_timing_.task_wall_ms[sample.max_nt] += sample.wall_ms;
@@ -701,6 +732,16 @@ void ExpertPool::run_phase(int mode, int n_tasks) {
                 native_task_timing_.sample_wall_ms += sample.wall_ms;
                 native_task_timing_.sample_cpu_ms += sample.cpu_ms;
                 ++native_task_timing_.samples;
+            }
+            if (mode == 5) {
+                const int align = fused_hq_ ? 32 : 1;
+                const int64_t units = mrows_ / align;
+                const int64_t start = (units * (int64_t) i / mtasks_) * align;
+                const int64_t stop = (units * (int64_t) (i + 1) / mtasks_) * align;
+                for (int64_t e = start / FF; start < stop && e <= (stop - 1) / FF; ++e) {
+                    auto& expert_finish = native_expert_finish_[(size_t) e];
+                    expert_finish = std::max(expert_finish, sample.finish_ns);
+                }
             }
         }
         native_worker_finish_.erase(std::remove(native_worker_finish_.begin(), native_worker_finish_.end(), 0),
@@ -712,6 +753,18 @@ void ExpertPool::run_phase(int mode, int n_tasks) {
             if (native_worker_finish_.size() % 2 == 0)
                 tail_ns += 0.5 * (double) (native_worker_finish_[mid] - native_worker_finish_[mid - 1]);
             native_task_timing_.tail_ms[mode - 5] += tail_ns / 1e6;
+        }
+        if (mode == 5 && !native_expert_finish_.empty()) {
+            const int64_t latest = *std::max_element(native_expert_finish_.begin(), native_expert_finish_.end());
+            double sum_ns = 0, max_ns = 0;
+            for (const int64_t finish : native_expert_finish_) {
+                const double gap_ns = (double) (latest - finish);
+                sum_ns += gap_ns;
+                max_ns = std::max(max_ns, gap_ns);
+            }
+            // A spanning row task delays this estimate until the whole task finishes.
+            native_task_timing_.gu_expert_mean_headroom_ms += sum_ns / native_expert_finish_.size() / 1e6;
+            native_task_timing_.gu_expert_max_headroom_ms += max_ns / 1e6;
         }
     }
     hstate_.store(kIdle, std::memory_order_relaxed);
@@ -866,6 +919,10 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         const long count = std::strtol(v, &end, 10);
         return end != v && *end == '\0' && count >= 1 && count <= 12 ? (int) count : 3;
     }();
+    static const bool pipeline = [] {
+        const char* v = std::getenv("STRATA_POOL_EXPERT_PIPELINE");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
     fused_hq_ = fuse && f.d_type == 20 && FF % 32 == 0;
     const auto t0 = std::chrono::steady_clock::now();
     // more distinct experts than buffers: run them in batches
@@ -879,6 +936,16 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         // Preserve the default three tasks/thread and fused quantization's block alignment.
         mtasks_ = fused_hq_ ? (std::min)(tasks_per_thread * threads, nb * FF / 32) : tasks_per_thread * threads;
         mrows_ = (int64_t) nb * FF;
+        if (pipeline && !fused_hq_ && nb > 1) {
+            for (int e = 0; e < nb; ++e) {
+                native_pipeline_[(size_t) e].gu_rows.store(FF, std::memory_order_relaxed);
+                native_pipeline_[(size_t) e].ready.store(false, std::memory_order_relaxed);
+            }
+            const auto begin = std::chrono::steady_clock::now();
+            run_phase(7, 2 * mtasks_);
+            ms_multi_pipeline += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+            continue;
+        }
         const auto a = std::chrono::steady_clock::now();
         run_phase(5, mtasks_);
         const auto b = std::chrono::steady_clock::now();

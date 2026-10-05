@@ -7073,6 +7073,7 @@ int main(int argc, char** argv) {
                 double gu, hq, down;
                 int64_t misses, entries, hits, pcie;
                 double park, drain, repark;
+                double pipeline;
             };
             auto dec_snap = [&]() {
                 double park, drain, repark;
@@ -7080,7 +7081,7 @@ int main(int argc, char** argv) {
                 return DecSnap{ver.ms_wait, ver.ms_pool, ver.ms_host, drive.d.ms_plan, drive.d.ms_actq, drive.d.ms_jobs,
                                drive.d.ms_run, pool.ms_multi_gu, pool.ms_multi_q, pool.ms_multi_down,
                                drive.d.multi_misses, drive.d.multi_entries, drive.d.cache_hits,
-                               drive.d.pcie_experts, park, drain, repark};
+                               drive.d.pcie_experts, park, drain, repark, pool.ms_multi_pipeline};
             };
             const DecSnap ds0 = dec_snap();
             const auto task_timing0 = pool.native_task_timing();
@@ -7220,8 +7221,9 @@ int main(int argc, char** argv) {
                              (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
                              (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L));
                 const std::string pr = ver.profile_report();
-                std::fprintf(stderr, "strata decode CPU phases (ms/window): gate/up %.2f quantize %.2f down %.2f\n",
-                             (d1.gu - ds0.gu) / w, (d1.hq - ds0.hq) / w, (d1.down - ds0.down) / w);
+                std::fprintf(stderr, "strata decode CPU phases (ms/window): gate/up %.2f quantize %.2f down %.2f pipeline %.2f\n",
+                             (d1.gu - ds0.gu) / w, (d1.hq - ds0.hq) / w, (d1.down - ds0.down) / w,
+                             (d1.pipeline - ds0.pipeline) / w);
                 const char* phase_env = std::getenv("STRATA_POOL_PHASE_TIMING");
                 if (phase_env != nullptr && std::atoi(phase_env) != 0) {
                     std::fprintf(stderr, "strata decode CPU pool (ms/window): pre-park %.2f drain-and-completion %.2f re-park %.2f\n",
@@ -7241,6 +7243,9 @@ int main(int argc, char** argv) {
                                      (unsigned long long) count);
                     }
                     std::fputc('\n', stderr);
+                    std::fprintf(stderr, "strata decode CPU pool GU expert finish headroom mean/max: %.2f/%.2f ms/window\n",
+                                 (task_timing.gu_expert_mean_headroom_ms - task_timing0.gu_expert_mean_headroom_ms) / w,
+                                 (task_timing.gu_expert_max_headroom_ms - task_timing0.gu_expert_max_headroom_ms) / w);
                     const auto& nt = drive.d.diagnostic_cpu_nt;
                     std::fprintf(stderr, "strata decode work: %016llx CPU blob bytes %llu groups1..8 %llu %llu %llu %llu %llu %llu %llu %llu; other %llu\n",
                                  (unsigned long long) drive.d.diagnostic_work_hash,
