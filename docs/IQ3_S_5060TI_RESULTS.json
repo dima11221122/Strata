@@ -1768,6 +1768,351 @@
       ],
       "observed_gpu": "2722 MHz, 13801 MHz, 132.00 W, 180.00 W, 64",
       "clocks_after_load": null
+    },
+    {
+      "candidate": "q6RowWarp",
+      "started": "2026-10-05T12:58:42.601Z",
+      "completed": "2026-10-05T13:00:17.703Z",
+      "engine_sha256": "8dcc96ecddcef157730a61eff8637b67932e4df334de827e97e8c197abd7f9e3",
+      "model": "IQ3_S",
+      "context_capacity": 65536,
+      "rates_tokens_per_second": [
+        60.3,
+        63.9,
+        76
+      ],
+      "median_tokens_per_second": 63.9,
+      "draft_accepted": 936,
+      "draft_total": 1149,
+      "output_sha256": [
+        "746fc5a534fcd3dab4f69af305d491c79ff9d60e9e9ed613661a53f6e490dabf",
+        "2c6647e2ec0cb815cd8577e6703b24ca9087d7245119224a73c911f69a309bc6",
+        "2f707e0fe5635ca12777e286b44a1b36ab71a641aa61a70552bde04dea19acb9"
+      ],
+      "observed_gpu": "2722 MHz, 13801 MHz, 132.32 W, 180.00 W, 68",
+      "clocks_after_load": null
+    },
+    {
+      "candidate": "cpuSignShuffle",
+      "started": "2026-10-05T13:00:24.733Z",
+      "completed": "2026-10-05T13:01:59.230Z",
+      "engine_sha256": "e494a8bdf97c09afbb76a79c15e6c1e7f60b9f2cf8dfcd24f9165446ca2609c0",
+      "model": "IQ3_S",
+      "context_capacity": 65536,
+      "rates_tokens_per_second": [
+        66,
+        62.8,
+        74.1
+      ],
+      "median_tokens_per_second": 66,
+      "draft_accepted": 936,
+      "draft_total": 1149,
+      "output_sha256": [
+        "746fc5a534fcd3dab4f69af305d491c79ff9d60e9e9ed613661a53f6e490dabf",
+        "2c6647e2ec0cb815cd8577e6703b24ca9087d7245119224a73c911f69a309bc6",
+        "2f707e0fe5635ca12777e286b44a1b36ab71a641aa61a70552bde04dea19acb9"
+      ],
+      "observed_gpu": "2722 MHz, 13801 MHz, 134.26 W, 180.00 W, 68",
+      "clocks_after_load": null
+    },
+    {
+      "candidate": "q6RowWarp",
+      "started": "2026-10-05T13:02:06.334Z",
+      "completed": "2026-10-05T13:03:37.488Z",
+      "engine_sha256": "8dcc96ecddcef157730a61eff8637b67932e4df334de827e97e8c197abd7f9e3",
+      "model": "IQ3_S",
+      "context_capacity": 65536,
+      "rates_tokens_per_second": [
+        66.9,
+        63.5,
+        76
+      ],
+      "median_tokens_per_second": 66.9,
+      "draft_accepted": 936,
+      "draft_total": 1149,
+      "output_sha256": [
+        "746fc5a534fcd3dab4f69af305d491c79ff9d60e9e9ed613661a53f6e490dabf",
+        "2c6647e2ec0cb815cd8577e6703b24ca9087d7245119224a73c911f69a309bc6",
+        "2f707e0fe5635ca12777e286b44a1b36ab71a641aa61a70552bde04dea19acb9"
+      ],
+      "observed_gpu": "2722 MHz, 13801 MHz, 134.09 W, 180.00 W, 68",
+      "clocks_after_load": null
+    },
+    {
+      "candidate": "cpuSignShuffle",
+      "started": "2026-10-05T13:03:44.537Z",
+      "completed": "2026-10-05T13:05:17.539Z",
+      "engine_sha256": "e494a8bdf97c09afbb76a79c15e6c1e7f60b9f2cf8dfcd24f9165446ca2609c0",
+      "model": "IQ3_S",
+      "context_capacity": 65536,
+      "rates_tokens_per_second": [
+        65.3,
+        63.2,
+        61.4
+      ],
+      "median_tokens_per_second": 63.2,
+      "draft_accepted": 936,
+      "draft_total": 1151,
+      "output_sha256": [
+        "746fc5a534fcd3dab4f69af305d491c79ff9d60e9e9ed613661a53f6e490dabf",
+        "2c6647e2ec0cb815cd8577e6703b24ca9087d7245119224a73c911f69a309bc6",
+        "2f707e0fe5635ca12777e286b44a1b36ab71a641aa61a70552bde04dea19acb9"
+      ],
+      "observed_gpu": "2737 MHz, 13801 MHz, 90.52 W, 180.00 W, 62",
+      "clocks_after_load": null
+    },
+    {
+      "candidate": "q6RowWarp",
+      "started": "2026-10-05T13:05:25.020Z",
+      "completed": "2026-10-05T13:07:00.100Z",
+      "engine_sha256": "8dcc96ecddcef157730a61eff8637b67932e4df334de827e97e8c197abd7f9e3",
+      "model": "IQ3_S",
+      "context_capacity": 65536,
+      "rates_tokens_per_second": [
+        55.4,
+        52.8,
+        74.8
+      ],
+      "median_tokens_per_second": 55.4,
+      "draft_accepted": 932,
+      "draft_total": 1156,
+      "output_sha256": [
+        "746fc5a534fcd3dab4f69af305d491c79ff9d60e9e9ed613661a53f6e490dabf",
+        "5f45636051b58fbc29d69cc255dae67bdeae2ae3b59731d180f2e36c6456de8b",
+        "2f707e0fe5635ca12777e286b44a1b36ab71a641aa61a70552bde04dea19acb9"
+      ],
+      "observed_gpu": "2722 MHz, 13801 MHz, 132.90 W, 180.00 W, 66",
+      "clocks_after_load": null
+    },
+    {
+      "candidate": "q6RowWarp",
+      "started": "2026-10-05T13:08:08.577Z",
+      "completed": "2026-10-05T13:09:54.982Z",
+      "engine_sha256": "8dcc96ecddcef157730a61eff8637b67932e4df334de827e97e8c197abd7f9e3",
+      "model": "IQ3_S",
+      "context_capacity": 65536,
+      "rates_tokens_per_second": [
+        58.5,
+        58,
+        68.3
+      ],
+      "median_tokens_per_second": 58.5,
+      "draft_accepted": 934,
+      "draft_total": 1150,
+      "output_sha256": [
+        "746fc5a534fcd3dab4f69af305d491c79ff9d60e9e9ed613661a53f6e490dabf",
+        "2c6647e2ec0cb815cd8577e6703b24ca9087d7245119224a73c911f69a309bc6",
+        "2f707e0fe5635ca12777e286b44a1b36ab71a641aa61a70552bde04dea19acb9"
+      ],
+      "observed_gpu": "2722 MHz, 13801 MHz, 125.63 W, 180.00 W, 66",
+      "clocks_after_load": null
+    },
+    {
+      "candidate": "cpuSpin100",
+      "started": "2026-10-05T13:09:55.364Z",
+      "completed": "2026-10-05T13:11:42.777Z",
+      "engine_sha256": "8dcc96ecddcef157730a61eff8637b67932e4df334de827e97e8c197abd7f9e3",
+      "model": "IQ3_S",
+      "context_capacity": 65536,
+      "rates_tokens_per_second": [
+        52.3,
+        49.4,
+        59.9
+      ],
+      "median_tokens_per_second": 52.3,
+      "draft_accepted": 936,
+      "draft_total": 1149,
+      "output_sha256": [
+        "746fc5a534fcd3dab4f69af305d491c79ff9d60e9e9ed613661a53f6e490dabf",
+        "2c6647e2ec0cb815cd8577e6703b24ca9087d7245119224a73c911f69a309bc6",
+        "2f707e0fe5635ca12777e286b44a1b36ab71a641aa61a70552bde04dea19acb9"
+      ],
+      "observed_gpu": "2722 MHz, 13801 MHz, 110.58 W, 180.00 W, 65",
+      "clocks_after_load": null
+    },
+    {
+      "candidate": "cpuSpin500",
+      "started": "2026-10-05T13:11:43.200Z",
+      "completed": "2026-10-05T13:13:31.433Z",
+      "engine_sha256": "8dcc96ecddcef157730a61eff8637b67932e4df334de827e97e8c197abd7f9e3",
+      "model": "IQ3_S",
+      "context_capacity": 65536,
+      "rates_tokens_per_second": [
+        41.3,
+        57.1,
+        70.4
+      ],
+      "median_tokens_per_second": 57.1,
+      "draft_accepted": 936,
+      "draft_total": 1149,
+      "output_sha256": [
+        "746fc5a534fcd3dab4f69af305d491c79ff9d60e9e9ed613661a53f6e490dabf",
+        "2c6647e2ec0cb815cd8577e6703b24ca9087d7245119224a73c911f69a309bc6",
+        "2f707e0fe5635ca12777e286b44a1b36ab71a641aa61a70552bde04dea19acb9"
+      ],
+      "observed_gpu": "2730 MHz, 13801 MHz, 125.66 W, 180.00 W, 64",
+      "clocks_after_load": null
+    },
+    {
+      "candidate": "cpuSpin1000",
+      "started": "2026-10-05T13:13:31.838Z",
+      "completed": "2026-10-05T13:15:16.270Z",
+      "engine_sha256": "8dcc96ecddcef157730a61eff8637b67932e4df334de827e97e8c197abd7f9e3",
+      "model": "IQ3_S",
+      "context_capacity": 65536,
+      "rates_tokens_per_second": [
+        55.4,
+        59.2,
+        67.5
+      ],
+      "median_tokens_per_second": 59.2,
+      "draft_accepted": 934,
+      "draft_total": 1150,
+      "output_sha256": [
+        "746fc5a534fcd3dab4f69af305d491c79ff9d60e9e9ed613661a53f6e490dabf",
+        "2c6647e2ec0cb815cd8577e6703b24ca9087d7245119224a73c911f69a309bc6",
+        "2f707e0fe5635ca12777e286b44a1b36ab71a641aa61a70552bde04dea19acb9"
+      ],
+      "observed_gpu": "2722 MHz, 13801 MHz, 125.65 W, 180.00 W, 65",
+      "clocks_after_load": null
+    },
+    {
+      "candidate": "q6RowWarp",
+      "started": "2026-10-05T13:15:16.682Z",
+      "completed": "2026-10-05T13:16:55.681Z",
+      "engine_sha256": "8dcc96ecddcef157730a61eff8637b67932e4df334de827e97e8c197abd7f9e3",
+      "model": "IQ3_S",
+      "context_capacity": 65536,
+      "rates_tokens_per_second": [
+        59.4,
+        63.8,
+        75.7
+      ],
+      "median_tokens_per_second": 63.8,
+      "draft_accepted": 936,
+      "draft_total": 1149,
+      "output_sha256": [
+        "746fc5a534fcd3dab4f69af305d491c79ff9d60e9e9ed613661a53f6e490dabf",
+        "2c6647e2ec0cb815cd8577e6703b24ca9087d7245119224a73c911f69a309bc6",
+        "2f707e0fe5635ca12777e286b44a1b36ab71a641aa61a70552bde04dea19acb9"
+      ],
+      "observed_gpu": "2722 MHz, 13801 MHz, 131.87 W, 180.00 W, 68",
+      "clocks_after_load": null
+    },
+    {
+      "candidate": "q6RowWarp",
+      "started": "2026-10-05T13:20:57.709Z",
+      "completed": "2026-10-05T13:22:33.762Z",
+      "engine_sha256": "8ad88fb66298ac1da0868acf6a14c303d539463d8560096361dfece23f9258cb",
+      "model": "IQ3_S",
+      "context_capacity": 65536,
+      "rates_tokens_per_second": [
+        67.8,
+        63.5,
+        62
+      ],
+      "median_tokens_per_second": 63.5,
+      "draft_accepted": 936,
+      "draft_total": 1149,
+      "output_sha256": [
+        "746fc5a534fcd3dab4f69af305d491c79ff9d60e9e9ed613661a53f6e490dabf",
+        "2c6647e2ec0cb815cd8577e6703b24ca9087d7245119224a73c911f69a309bc6",
+        "2f707e0fe5635ca12777e286b44a1b36ab71a641aa61a70552bde04dea19acb9"
+      ],
+      "observed_gpu": "2722 MHz, 13801 MHz, 113.28 W, 180.00 W, 67",
+      "clocks_after_load": null
+    },
+    {
+      "candidate": "q6TwoRows",
+      "started": "2026-10-05T13:22:34.124Z",
+      "completed": "2026-10-05T13:24:13.946Z",
+      "engine_sha256": "8ad88fb66298ac1da0868acf6a14c303d539463d8560096361dfece23f9258cb",
+      "model": "IQ3_S",
+      "context_capacity": 65536,
+      "rates_tokens_per_second": [
+        57,
+        60.2,
+        76.3
+      ],
+      "median_tokens_per_second": 60.2,
+      "draft_accepted": 923,
+      "draft_total": 1152,
+      "output_sha256": [
+        "99fb794a77d691cc36de1507ccbd88a91629cd10a2c65fef585381167bdd2423",
+        "604c9698bd0b349ea43ad683f42ed879f6c83572f18681e36fd74cfae71d977b",
+        "0d4572df9eac4574292713c1093d2892e567a5567dada51ca7c2cc13d137265f"
+      ],
+      "observed_gpu": "2730 MHz, 13801 MHz, 130.89 W, 180.00 W, 66",
+      "clocks_after_load": null
+    },
+    {
+      "candidate": "q6RowWarp",
+      "started": "2026-10-05T13:24:14.330Z",
+      "completed": "2026-10-05T13:25:48.917Z",
+      "engine_sha256": "8ad88fb66298ac1da0868acf6a14c303d539463d8560096361dfece23f9258cb",
+      "model": "IQ3_S",
+      "context_capacity": 65536,
+      "rates_tokens_per_second": [
+        67.1,
+        63.6,
+        75.4
+      ],
+      "median_tokens_per_second": 67.1,
+      "draft_accepted": 936,
+      "draft_total": 1149,
+      "output_sha256": [
+        "746fc5a534fcd3dab4f69af305d491c79ff9d60e9e9ed613661a53f6e490dabf",
+        "2c6647e2ec0cb815cd8577e6703b24ca9087d7245119224a73c911f69a309bc6",
+        "2f707e0fe5635ca12777e286b44a1b36ab71a641aa61a70552bde04dea19acb9"
+      ],
+      "observed_gpu": "2722 MHz, 13801 MHz, 133.65 W, 180.00 W, 68",
+      "clocks_after_load": null
+    },
+    {
+      "candidate": "q6TwoRows",
+      "started": "2026-10-05T13:25:49.306Z",
+      "completed": "2026-10-05T13:27:25.684Z",
+      "engine_sha256": "8ad88fb66298ac1da0868acf6a14c303d539463d8560096361dfece23f9258cb",
+      "model": "IQ3_S",
+      "context_capacity": 65536,
+      "rates_tokens_per_second": [
+        60.8,
+        61.1,
+        77.3
+      ],
+      "median_tokens_per_second": 61.1,
+      "draft_accepted": 923,
+      "draft_total": 1142,
+      "output_sha256": [
+        "99fb794a77d691cc36de1507ccbd88a91629cd10a2c65fef585381167bdd2423",
+        "b4115237476fa047cb4c6861820b4832f268d89edd4ea95b79d8747240c3b0f3",
+        "085ca6cc39d884bd86dba5072e87b89f8f034dcea1cecd41d4b8d10dca50a25d"
+      ],
+      "observed_gpu": "2730 MHz, 13801 MHz, 128.63 W, 180.00 W, 66",
+      "clocks_after_load": null
+    },
+    {
+      "candidate": "q6RowWarp",
+      "started": "2026-10-05T13:27:26.004Z",
+      "completed": "2026-10-05T13:29:07.002Z",
+      "engine_sha256": "8ad88fb66298ac1da0868acf6a14c303d539463d8560096361dfece23f9258cb",
+      "model": "IQ3_S",
+      "context_capacity": 65536,
+      "rates_tokens_per_second": [
+        63.8,
+        64.4,
+        76
+      ],
+      "median_tokens_per_second": 64.4,
+      "draft_accepted": 936,
+      "draft_total": 1149,
+      "output_sha256": [
+        "746fc5a534fcd3dab4f69af305d491c79ff9d60e9e9ed613661a53f6e490dabf",
+        "2c6647e2ec0cb815cd8577e6703b24ca9087d7245119224a73c911f69a309bc6",
+        "2f707e0fe5635ca12777e286b44a1b36ab71a641aa61a70552bde04dea19acb9"
+      ],
+      "observed_gpu": "2722 MHz, 13801 MHz, 134.95 W, 180.00 W, 66",
+      "clocks_after_load": null
     }
   ]
 }

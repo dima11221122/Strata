@@ -171,6 +171,7 @@ public:
     /// read once for all of its tokens.
     void run_split_multi(ExpertJobMulti* jobs, int n);
     /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
+    /// STRATA_POOL_TASKS_PER_THREAD=1..12 overrides the default3 row-task count per thread.
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
     static constexpr int kMaxSplitMulti = 96;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
@@ -194,6 +195,24 @@ public:
         drain = ms_drain_;
         repark = ms_repark_;
     }
+
+    /// STRATA_POOL_PHASE_TIMING=1: native GU/down synchronization and execution totals.
+    /// Drain includes host work and waiting for the other workers to finish. Host-owned.
+    void native_phase_ms(double& wait_park, double& drain, double& repark) const {
+        wait_park = ms_native_wait_park_;
+        drain = ms_native_drain_;
+        repark = ms_native_repark_;
+    }
+
+    struct NativeTaskTiming {
+        double tail_ms[2] = {}; // latest minus median active worker finish, GU/down
+        double sample_wall_ms = 0, sample_cpu_ms = 0;
+        uint64_t samples = 0;
+        double task_wall_ms[9] = {}; // indexed by largest input group in the row task
+        uint64_t tasks[9] = {};
+    };
+    /// Diagnostic only; CPU sampling excludes parked spinning and is unavailable on Windows.
+    NativeTaskTiming native_task_timing() const { return native_task_timing_; }
 
     /// **A PARKED WORKER SPINS FOR THIS LONG, THEN SLEEPS.**  The park is a `_mm_pause` spin because a layer's
     /// batches are microseconds apart and a wake-up from the OS costs more than that.  But a spin that never ends
@@ -248,6 +267,15 @@ private:
     double ms_wait_park_ = 0.0;
     double ms_drain_ = 0.0;
     double ms_repark_ = 0.0;
+    double ms_native_wait_park_ = 0.0, ms_native_drain_ = 0.0, ms_native_repark_ = 0.0;
+    struct alignas(64) NativeTaskSample {
+        double wall_ms = 0, cpu_ms = -1;
+        int64_t finish_ns = 0;
+        int worker = 0, max_nt = 0;
+    };
+    std::vector<NativeTaskSample> native_task_samples_; // one writer per claimed task, before done
+    std::vector<int64_t> native_worker_finish_;        // host-only scratch, after completion
+    NativeTaskTiming native_task_timing_;
     // ---- EACH ATOMIC GETS ITS OWN CACHE LINE, AND THE SPIN COUNTER IS GONE.  (Review finding C3.)
     //
     // These were six adjacent atomics, which put `head_`, `done_`, `parked_` and `epoch_` on ONE cache line -

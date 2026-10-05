@@ -2232,6 +2232,31 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             ++d.multi_entries;
         }
     const auto c3 = std::chrono::steady_clock::now();
+    static const bool work_diagnostic = [] {
+        const char* v = std::getenv("STRATA_POOL_PHASE_TIMING");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    if (work_diagnostic) {
+        const auto mix = [&](uint64_t value) {
+            d.diagnostic_work_hash = (d.diagnostic_work_hash ^ value) * 1099511628211ull;
+        };
+        mix((uint64_t) d.layers);
+        mix((uint64_t) n_tok);
+        mix((uint64_t) k);
+        mix(native ? (uint64_t) lay.fmt[(size_t) d.layers].gu_type : 0);
+        mix(native ? (uint64_t) lay.fmt[(size_t) d.layers].d_type : 0);
+        const uint64_t bytes = lay.blob_bytes(d.layers);
+        mix(bytes);
+        for (int64_t i = 0; i < n; ++i) {
+            mix((uint64_t) ids[i]);
+            mix((uint64_t) (kind[i] + 2));
+        }
+        for (int j = 0; j < njobs; ++j) {
+            const int nt = d.jobs_multi[(size_t) j].nt;
+            ++d.diagnostic_cpu_nt[nt >= 1 && nt <= 8 ? nt : 0];
+            d.diagnostic_cpu_bytes += bytes;
+        }
+    }
     pt("run", njobs);
     if (njobs > 0) {
         if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);

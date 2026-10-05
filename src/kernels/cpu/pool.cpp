@@ -11,6 +11,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -27,6 +28,23 @@ namespace strata::kernels::cpu {
 namespace {
 constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
     return ((uint64_t) epoch << 32) | ((uint64_t) n << 16) | (uint64_t) i;
+}
+
+bool native_phase_timing_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("STRATA_POOL_PHASE_TIMING");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return enabled;
+}
+
+double task_thread_cpu_ms() {
+#if !defined(_WIN32) && defined(CLOCK_THREAD_CPUTIME_ID)
+    timespec ts{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0)
+        return (double) ts.tv_sec * 1000.0 + (double) ts.tv_nsec / 1e6;
+#endif
+    return -1;
 }
 }  // namespace
 
@@ -548,6 +566,10 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
         const uint32_t i = (uint32_t) ci;
         if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);
         else { hstate_.store(ci, std::memory_order_relaxed); hstate_ms_.store(now_ms(), std::memory_order_relaxed); }
+        const bool timed = mode_ >= 5 && native_phase_timing_enabled();
+        const auto task_start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const double cpu_start = timed && i % 16 == 0 ? task_thread_cpu_ms() : -1;
+        int max_nt = 0;
         if (mode_ == 0) {
             const ExpertJob& j = jobs_[i];
             s2_expert_vnni_q(j.blob, *j.act, j.out, scratch);
@@ -570,6 +592,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 const int e = (int) (r / per), r0 = (int) (r % per);
                 const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
                 SplitBufMulti& sb = split_multi_[(size_t) e];
+                if (timed) max_nt = std::max(max_nt, mjobs_[e].nt);
                 if (mode_ == 5 && q2_native_kernels(nfmt_->gu_type)) {
                     // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
                     thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
@@ -631,18 +654,66 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 r += r1 - r0;
             }
         }
+        if (timed) {
+            const double cpu_end = cpu_start >= 0 ? task_thread_cpu_ms() : -1;
+            const auto end = std::chrono::steady_clock::now();
+            auto& sample = native_task_samples_[i];
+            sample.wall_ms = std::chrono::duration<double, std::milli>(end - task_start).count();
+            sample.cpu_ms = cpu_end >= cpu_start && cpu_start >= 0 ? cpu_end - cpu_start : -1;
+            sample.finish_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end.time_since_epoch()).count();
+            sample.worker = id >= 0 ? id : n_;
+            sample.max_nt = max_nt >= 1 && max_nt <= 8 ? max_nt : 0;
+        }
         done_.fetch_add(1, std::memory_order_release);
     }
 }
 
 void ExpertPool::run_phase(int mode, int n_tasks) {
+    const bool timed = native_phase_timing_enabled() && (mode == 5 || mode == 6);
+    const auto a = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     wait_parked("before a phase");
+    if (timed) {
+        native_task_samples_.resize((size_t) n_tasks);
+        native_worker_finish_.assign((size_t) n_ + 1, 0);
+    }
+    const auto b = timed ? std::chrono::steady_clock::now() : a;
     mode_ = mode;
     njobs_ = n_tasks;
     const uint32_t e = begin_batch(n_tasks);
     if (host_works_) drain(-1, host_scratch_, e);
     wait_done(n_tasks);
+    const auto c = timed ? std::chrono::steady_clock::now() : b;
     wait_parked("after a phase");
+    if (timed) {
+        const auto d = std::chrono::steady_clock::now();
+        ms_native_wait_park_ += std::chrono::duration<double, std::milli>(b - a).count();
+        // Includes the host's work and waiting for other workers' completion.
+        ms_native_drain_ += std::chrono::duration<double, std::milli>(c - b).count();
+        ms_native_repark_ += std::chrono::duration<double, std::milli>(d - c).count();
+        // Every sample is written before its task's release increment of done_.
+        // Late sleepers that cannot claim this epoch never touch the sample array.
+        for (const auto& sample : native_task_samples_) {
+            auto& finish = native_worker_finish_[(size_t) sample.worker];
+            finish = std::max(finish, sample.finish_ns);
+            native_task_timing_.task_wall_ms[sample.max_nt] += sample.wall_ms;
+            ++native_task_timing_.tasks[sample.max_nt];
+            if (sample.cpu_ms >= 0) {
+                native_task_timing_.sample_wall_ms += sample.wall_ms;
+                native_task_timing_.sample_cpu_ms += sample.cpu_ms;
+                ++native_task_timing_.samples;
+            }
+        }
+        native_worker_finish_.erase(std::remove(native_worker_finish_.begin(), native_worker_finish_.end(), 0),
+                                    native_worker_finish_.end());
+        std::sort(native_worker_finish_.begin(), native_worker_finish_.end());
+        if (!native_worker_finish_.empty()) {
+            const size_t mid = native_worker_finish_.size() / 2;
+            double tail_ns = (double) (native_worker_finish_.back() - native_worker_finish_[mid]);
+            if (native_worker_finish_.size() % 2 == 0)
+                tail_ns += 0.5 * (double) (native_worker_finish_[mid] - native_worker_finish_[mid - 1]);
+            native_task_timing_.tail_ms[mode - 5] += tail_ns / 1e6;
+        }
+    }
     hstate_.store(kIdle, std::memory_order_relaxed);
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
 }
@@ -788,6 +859,13 @@ void ExpertPool::prepare_packed_jobs(const NativeFmt& f, int n) {
 void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
     if (n <= 0) return;
     static const bool fuse = [] { const char* v = std::getenv("STRATA_POOL_FUSED_HQ"); return v != nullptr && std::atoi(v) != 0; }();
+    static const int tasks_per_thread = [] {
+        const char* v = std::getenv("STRATA_POOL_TASKS_PER_THREAD");
+        if (v == nullptr) return 3;
+        char* end = nullptr;
+        const long count = std::strtol(v, &end, 10);
+        return end != v && *end == '\0' && count >= 1 && count <= 12 ? (int) count : 3;
+    }();
     fused_hq_ = fuse && f.d_type == 20 && FF % 32 == 0;
     const auto t0 = std::chrono::steady_clock::now();
     // more distinct experts than buffers: run them in batches
@@ -797,7 +875,9 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         nfmt_ = &f;
         prepare_packed_jobs(f, nb);
         const int threads = n_ + (host_works_ ? 1 : 0);
-        mtasks_ = fused_hq_ ? (std::min)(3 * threads, nb * FF / 32) : 3 * threads;
+        // Smaller native row tasks can reduce tails from mixed input-group costs.
+        // Preserve the default three tasks/thread and fused quantization's block alignment.
+        mtasks_ = fused_hq_ ? (std::min)(tasks_per_thread * threads, nb * FF / 32) : tasks_per_thread * threads;
         mrows_ = (int64_t) nb * FF;
         const auto a = std::chrono::steady_clock::now();
         run_phase(5, mtasks_);

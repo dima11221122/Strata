@@ -7063,20 +7063,30 @@ int main(int argc, char** argv) {
             for (int64_t i = 0; i < n - 1; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
             const char* finish = "length";
             const Clock::time_point d0 = Clock::now();
-            // STRATA_DECODE_TIMING=1: where a request's decode time goes (one line per request)
+            // STRATA_DECODE_TIMING=1: where a request's decode time goes (summaries per request)
             static const bool dec_timing = std::getenv("STRATA_DECODE_TIMING") != nullptr;
+            drive.d.diagnostic_work_hash = 14695981039346656037ull;
+            drive.d.diagnostic_cpu_bytes = 0;
+            for (auto& count : drive.d.diagnostic_cpu_nt) count = 0;
             struct DecSnap {
                 double wait, pool, host, plan, actq, jobs, run;
+                double gu, hq, down;
                 int64_t misses, entries, hits, pcie;
+                double park, drain, repark;
             };
             auto dec_snap = [&]() {
+                double park, drain, repark;
+                pool.native_phase_ms(park, drain, repark);
                 return DecSnap{ver.ms_wait, ver.ms_pool, ver.ms_host, drive.d.ms_plan, drive.d.ms_actq, drive.d.ms_jobs,
-                               drive.d.ms_run, drive.d.multi_misses, drive.d.multi_entries, drive.d.cache_hits,
-                               drive.d.pcie_experts};
+                               drive.d.ms_run, pool.ms_multi_gu, pool.ms_multi_q, pool.ms_multi_down,
+                               drive.d.multi_misses, drive.d.multi_entries, drive.d.cache_hits,
+                               drive.d.pcie_experts, park, drain, repark};
             };
             const DecSnap ds0 = dec_snap();
+            const auto task_timing0 = pool.native_task_timing();
             double dt_run = 0, dt_commit = 0, dt_draft = 0;
             int64_t dec_windows = 0, dec_T = 0;
+            int64_t dec_width[9] = {}; // bucket0 contains widths outside1..8
             const int64_t decode_hits0 = drive.d.cache_hits;
             // CS-T: the RAM and file tiers of this request (the mmap source; 0 with the arena)
             const int64_t ram0 = src.ram_reads(), files0 = src.file_reads();
@@ -7172,6 +7182,7 @@ int main(int argc, char** argv) {
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
                     dt_run += msd(tw0, tw1); dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
                     ++dec_windows; dec_T += T;
+                    ++dec_width[T >= 1 && T <= 8 ? T : 0];
                 }
                 if (adapt_thr.joinable()) adapt_thr.join();
                 if (!adapt_ok) {
@@ -7209,6 +7220,40 @@ int main(int argc, char** argv) {
                              (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
                              (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L));
                 const std::string pr = ver.profile_report();
+                std::fprintf(stderr, "strata decode CPU phases (ms/window): gate/up %.2f quantize %.2f down %.2f\n",
+                             (d1.gu - ds0.gu) / w, (d1.hq - ds0.hq) / w, (d1.down - ds0.down) / w);
+                const char* phase_env = std::getenv("STRATA_POOL_PHASE_TIMING");
+                if (phase_env != nullptr && std::atoi(phase_env) != 0) {
+                    std::fprintf(stderr, "strata decode CPU pool (ms/window): pre-park %.2f drain-and-completion %.2f re-park %.2f\n",
+                                 (d1.park - ds0.park) / w, (d1.drain - ds0.drain) / w, (d1.repark - ds0.repark) / w);
+                    const auto task_timing = pool.native_task_timing();
+                    std::fprintf(stderr, "strata decode CPU pool tasks: GU/down finish tails %.2f/%.2f ms/window; sampled execution wall/CPU %.2f/%.2f ms over %llu tasks\n",
+                                 (task_timing.tail_ms[0] - task_timing0.tail_ms[0]) / w,
+                                 (task_timing.tail_ms[1] - task_timing0.tail_ms[1]) / w,
+                                 task_timing.sample_wall_ms - task_timing0.sample_wall_ms,
+                                 task_timing.sample_cpu_ms - task_timing0.sample_cpu_ms,
+                                 (unsigned long long) (task_timing.samples - task_timing0.samples));
+                    std::fprintf(stderr, "strata decode CPU pool task means (us,count) by max input group:");
+                    for (int nt = 0; nt <= 8; ++nt) {
+                        const uint64_t count = task_timing.tasks[nt] - task_timing0.tasks[nt];
+                        const double ms = task_timing.task_wall_ms[nt] - task_timing0.task_wall_ms[nt];
+                        std::fprintf(stderr, " %d:%.2f,%llu", nt, count ? ms * 1000.0 / count : 0,
+                                     (unsigned long long) count);
+                    }
+                    std::fputc('\n', stderr);
+                    const auto& nt = drive.d.diagnostic_cpu_nt;
+                    std::fprintf(stderr, "strata decode work: %016llx CPU blob bytes %llu groups1..8 %llu %llu %llu %llu %llu %llu %llu %llu; other %llu\n",
+                                 (unsigned long long) drive.d.diagnostic_work_hash,
+                                 (unsigned long long) drive.d.diagnostic_cpu_bytes,
+                                 (unsigned long long) nt[1], (unsigned long long) nt[2],
+                                 (unsigned long long) nt[3], (unsigned long long) nt[4],
+                                 (unsigned long long) nt[5], (unsigned long long) nt[6],
+                                 (unsigned long long) nt[7], (unsigned long long) nt[8], (unsigned long long) nt[0]);
+                }
+                std::fprintf(stderr, "strata decode widths1..8: %lld %lld %lld %lld %lld %lld %lld %lld; other %lld\n",
+                             (long long) dec_width[1], (long long) dec_width[2], (long long) dec_width[3],
+                             (long long) dec_width[4], (long long) dec_width[5], (long long) dec_width[6],
+                             (long long) dec_width[7], (long long) dec_width[8], (long long) dec_width[0]);
                 if (!pr.empty()) std::fprintf(stderr, "strata decode GPU stages (ms/window):%s\n", pr.c_str());
             }
             if (!cancelled) {

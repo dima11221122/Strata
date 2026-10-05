@@ -1073,30 +1073,38 @@ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w
     }
 }
 
-// Experimental Q6_K layout: each warp owns a complete output row, eliminating
+// Experimental Q6_K layout: each warp owns one or two complete output rows, eliminating
 // the cross-warp shared-memory reduction. The quantized dot remains unchanged;
 // accumulating blocks in one warp changes floating-point summation order.
-template<int NCOLS>
+template<int NCOLS, int ROWS = 1>
 __launch_bounds__(WARPS * WARP, 4)
 __global__ void native_q6_k_rowwarp_kernel(const Q6KBlock* __restrict__ w,
                                           const Q81Block* __restrict__ x,
                                           float* __restrict__ y, int n_in, int n_out) {
     const int lane = int(threadIdx.x);
-    const int row = int(blockIdx.x) * WARPS + int(threadIdx.y);
+    const int row = (int(blockIdx.x) * WARPS + int(threadIdx.y)) * ROWS;
     if (row >= n_out) return;
     const int blocks_per_row = n_in / QK;
     const int x_stride = n_in / Q8K;
-    float acc[NCOLS] = {};
+    float acc[ROWS][NCOLS] = {};
     for (int kb = 0; kb < blocks_per_row; ++kb) {
-        const auto weight = Q6KTraits::load(w + std::size_t(row) * blocks_per_row + kb, lane);
 #pragma unroll
-        for (int j = 0; j < NCOLS; ++j)
-            acc[j] += Q6KTraits::apply(weight, x + std::size_t(j) * x_stride + kb * 8, lane);
+        for (int r = 0; r < ROWS; ++r) {
+            if (row + r >= n_out) continue;
+            const auto weight = Q6KTraits::load(w + std::size_t(row + r) * blocks_per_row + kb, lane);
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j)
+                acc[r][j] += Q6KTraits::apply(weight, x + std::size_t(j) * x_stride + kb * 8, lane);
+        }
     }
 #pragma unroll
-    for (int j = 0; j < NCOLS; ++j) {
-        const float value = warp_sum(acc[j]);
-        if (lane == 0) y[std::size_t(j) * n_out + row] = value;
+    for (int r = 0; r < ROWS; ++r) {
+        if (row + r >= n_out) continue;
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) {
+            const float value = warp_sum(acc[r][j]);
+            if (lane == 0) y[std::size_t(j) * n_out + row + r] = value;
+        }
     }
 }
 
@@ -1111,8 +1119,17 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
             return value && std::atoi(value) != 0;
         }();
         if (rowwarp) {
-            const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-            native_q6_k_rowwarp_kernel<NCOLS><<<blocks, dim3(WARP, WARPS), 0, s>>>(w, x, y, n_in, n_out);
+            static const bool two_rows = [] {
+                const char* value = std::getenv("STRATA_Q6_ROWS_PER_WARP");
+                return value && std::atoi(value) == 2;
+            }();
+            if (two_rows) {
+                const unsigned blocks = unsigned((std::size_t(n_out) + 2 * WARPS - 1) / (2 * WARPS));
+                native_q6_k_rowwarp_kernel<NCOLS, 2><<<blocks, dim3(WARP, WARPS), 0, s>>>(w, x, y, n_in, n_out);
+            } else {
+                const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+                native_q6_k_rowwarp_kernel<NCOLS><<<blocks, dim3(WARP, WARPS), 0, s>>>(w, x, y, n_in, n_out);
+            }
             return;
         }
         static const bool enabled = [] {

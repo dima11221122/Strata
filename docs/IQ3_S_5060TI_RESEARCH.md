@@ -148,6 +148,38 @@ Two default-off probes target the existing verifier path. `STRATA_Q6_COMPACT_MUL
 
 After the gain repeated, the existing MMVQ contract check and both96-case numerical suites passed. The new suites compare independent scalar Q6_K dequantization and FP64 dots over the same Q8_1 bytes, with widths256/512/2560/8192, ragged row tails, inactive-output sentinels and captured launches. Worst relative L2 errors were2.164e-7 for the default and2.169e-7 for rowwarp (limit3e-6). Three generated Python functions passed their assertions, and retrieval returned the exact code from a20,534-token prompt. Missing/invalid/correct credentials returned401/401/200. Both remote and local Pi completed a real bash printf tool call and final response. Context capacity remains65,536; the retrieval check did not fill that entire capacity.
 
+### CPU phase and sign-decoding probes
+
+`STRATA_DECODE_TIMING=1` now prints request-local deltas of the existing CPU pool gate/up, activation quantization and down timers. It does not enable GPU event profiling or change model arithmetic. One512-token diagnostic with the retained Q6 setting measured49.9 tokens/s and16.32/0.22/5.26ms per window for these phases. This is not a three-prompt benchmark or a hardware ceiling.
+
+A throwaway sign-decoding change replaced two128-bit shuffles and an insert with one256-bit broadcast/shuffle, preserving the sign bytes without expanding weight memory. Its basic diagnostic measured68.4 tokens/s and6.38/0.20/3.00ms/window. Both GU and down changed, so that isolated observation cannot attribute the improvement to the sign change. Saved binaries were compared under the same Q6 setting:
+
+| Run | Rates, tokens/s | Median |
+|---|---|---:|
+| Control |60.3,63.9,76.0|63.9|
+| Sign shuffle |66.0,62.8,74.1|66.0|
+| Control |66.9,63.5,76.0|66.9|
+| Sign shuffle |65.3,63.2,61.4|63.2|
+| Control |55.4,52.8,74.8|55.4|
+
+No repeatable gain was established; the sign source change is reverted. Several identical-output runs differ considerably in speed, including the candidate's TypeScript result, so answer changes alone do not explain the variance. No regression suite ran for this rejected probe. Valid three-prompt records remain separate from single diagnostic records.
+
+Shortening the existing worker spin-before-sleep threshold from20,000us to100/500/1000us measured medians52.3/57.1/59.2 against58.5/63.8 controls. The100us rates were52.3/49.4/59.9,500us41.3/57.1/70.4,1000us55.4/59.2/67.5. The retained Q6 flag stayed enabled. No improvement was established, so the default worker threshold is restored; no new source or regression suite was needed.
+
+### Two-row Q6 and comparable-work diagnostics
+
+`STRATA_Q6_ROWS_PER_WARP=2`, with the retained rowwarp flag enabled, gives each warp two guarded output rows. Each row preserves the original block order and Q6_K/Q8_1 dot, with separate accumulators. It halves row-block count and may expose instruction overlap, but activation reuse is not explicit and additional registers may hurt. The default remains one row. Basic generation measured56.4 for one row and57.7 for two; alternating three-prompt medians were63.5/60.2/67.1/61.1/64.4. Both two-row repetitions lost to their nearby controls, so the option stays disabled. Regression was not run for this rejected candidate.
+
+`STRATA_POOL_PHASE_TIMING=1`, together with decode timing, separates native pool pre-park, drain-and-completion and re-park durations. Existing GU/down phase counters include synchronization; neither those counters nor drain are pure kernel time. Request-end summaries also report verification-width counts, an ordered dispatch digest covering layer, width, routes, placement and formats, CPU input-group counts, and logical CPU expert-blob bytes. The digest does not compare activation values; logical bytes are not measured hardware memory traffic. Diagnostics remain disabled by default and do not change placement or model arithmetic.
+
+The next optimization depends on the exposed tail. Unequal worker completion correlated with format/input count supports smaller or cost-weighted CPU tasks; uniformly costly tasks do not establish imbalance. Per-expert GU/quant/down pipelining is justified only if early expert completion can fill otherwise idle worker time. Latency-based PCIe placement needs evidence that CPU finishes later and the GPU can absorb transfer plus compute. Aggregate CPU timers alone cannot select among these changes.
+
+The first three identical-prompt basic replays used executable `d4bd47b6ae5ab41db1fee41698bbd4869726ed971fafcf880fb2e13f53c96be3`. They measured59.7/65.6/67.3 tokens/s, with different answers, widths and dispatch digests. Drain-and-completion was14.28/9.49/9.77ms/window; pre-/re-park combined0.46/0.07/0.07ms/window. This localizes most pool time beyond parking but does not prove unequal tasks. These records are diagnostics, excluded from benchmark medians. Subsequent opt-in task sampling records all task wall durations and active worker final completion, plus execution thread CPU time every16th task. Sampling excludes parked spinning but adds overhead; sampled totals and finish tails are diagnostic, not a recoverable-time guarantee. CPU sampling reports zero samples on platforms without a thread CPU clock.
+
+The task diagnostic (`3310fd5f6f5d9b04a5c03460ec12cbb8dabeac50c86a2805b5af502ef311bd25`) measured51.3/59.1/59.9 tokens/s. Warm replay GU/down completion tails were1.38/0.76 and1.53/0.73ms/window; sampled execution CPU was3721.86/3864.30 and3723.62/3866.45ms wall. Mean task duration increased from roughly34–35us at maximum group1 to62–63us at group4. These means mix layers and GU/down, and sampling can miss delays. This build used the upper middle finish for even active-worker counts; the corrected source averages the middle pair, so those tails are lower estimates. `STRATA_POOL_TASKS_PER_THREAD=6` is the resulting bounded balancing probe: double the native phase's default task count, keeping original row arithmetic and the fused quantization's32-row cap. Invalid/unset values retain3; accepted range1..12. First measure basic and complete decode without diagnostics; require repeats before regression.
+
+The first uninstrumented basic comparison measured52.6 tokens/s for three tasks/thread and51.4 for six. This does not show a gain. A warm-replay comparison is pending to distinguish this result from the large first-request tails. No numerical regression ran for the task-count probe, and it remains disabled on the retained service.
+
 ### Placement
 
 `STRATA_PCIE_REUSE=1` selects the missed, pinned experts serving the most input rows, subject to the same transfer quota and staging limit. Ties retain the old last-in-routing-order choice. Resident and peer-GPU experts are excluded. This transfers the same expert blob once for multiple inputs and leaves CPU/GPU result merging unchanged.
