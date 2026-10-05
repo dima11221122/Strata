@@ -37,6 +37,7 @@
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_gdn.hpp"
@@ -5467,9 +5468,22 @@ int main(int argc, char** argv) {
                 cudaMemcpy(st->d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
             }
         };
-        auto apply_pending = [&](bool wait) {
+        struct PendingTiming {
+            // Completed local/stage applies: readiness, unpin, RAM commit, residency update/upload.
+            // Peer work and unsuccessful readiness queries remain in the outer apply-pending timer.
+            double phase_ms[5] = {};
+            uint64_t applies = 0, swaps = 0, admission_bytes = 0;
+        };
+        auto apply_pending = [&](bool wait, PendingTiming* timing = nullptr) {
             if (peer.valid()) peer.apply_pending(wait);
             if (pending.empty()) return;
+            Clock::time_point checkpoint = timing ? Clock::now() : Clock::time_point{};
+            auto stamp = [&](int phase) {
+                if (timing == nullptr) return;
+                const Clock::time_point now = Clock::now();
+                timing->phase_ms[phase] += std::chrono::duration<double, std::milli>(now - checkpoint).count();
+                checkpoint = now;
+            };
             if (wait) cudaEventSynchronize(adapt_ev);
             else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
             for (auto& st : stages)
@@ -5478,14 +5492,26 @@ int main(int argc, char** argv) {
                     else if (cudaEventQuery(st->adapt_ev) != cudaSuccess) return;
                 }
             for (auto& st : stages) st->adapt_live = false;
+            stamp(0);
             unpin_blobs(pin_live);
+            stamp(1);
             src.commit_exchanges();   // the resident RAM mode: the evicted experts take their places in RAM
+            stamp(2);
+            if (timing != nullptr) {
+                ++timing->applies;
+                timing->swaps += pending.size();
+                for (const auto& item : pending)
+                    timing->admission_bytes += (uint64_t) strata::kernels::cpu::expert_layout().blob_bytes(
+                        (int64_t) item.first / g.n_expert);
+            }
             for (const auto& [i, slot] : pending) {
                 host_res[(size_t) i] = slot;
                 srcp->release((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);   // in VRAM now: RAM not needed
             }
             pending.clear();
+            stamp(3);
             res_upload();
+            stamp(4);
         };
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
@@ -7065,6 +7091,32 @@ int main(int argc, char** argv) {
             const Clock::time_point d0 = Clock::now();
             // STRATA_DECODE_TIMING=1: where a request's decode time goes (summaries per request)
             static const bool dec_timing = std::getenv("STRATA_DECODE_TIMING") != nullptr;
+            static const bool adapt_overlap_requested = [] {
+                const char* v = std::getenv("STRATA_ADAPT_VERIFY_OVERLAP");
+                return v != nullptr && std::atoi(v) != 0;
+            }();
+            // Only the arena's immutable CPU copy and one local cache participate in this experiment.
+            const bool adapt_overlap = adapt_overlap_requested && srcp == &arena_src && !multi_gpu &&
+                stages.empty() && !peer.valid() && !remote_opt && !o.no_pool && d_res != nullptr &&
+                o.expert_cache_remote[0] <= 0 && o.expert_cache_remote[1] <= 0 && o.expert_cache_remote[2] <= 0;
+            // A copy-engine table upload queues behind the large adaptive H2D refills. Publish this
+            // small snapshot with the existing mapped-memory kernel instead, before verifier replay.
+            std::unique_ptr<void, decltype(&cudaFreeHost)> eviction_snapshot(nullptr, cudaFreeHost);
+            int32_t* mapped_evictions = nullptr;
+            if (adapt_overlap) {
+                void* host = nullptr;
+                cudaError_t alloc = cudaHostAlloc(&host, host_res.size() * sizeof(int32_t), cudaHostAllocMapped);
+                eviction_snapshot.reset(host);
+                if (alloc == cudaSuccess)
+                    alloc = cudaHostGetDevicePointer((void**) &mapped_evictions, host, 0);
+                if (alloc != cudaSuccess) {
+                    std::printf("ERR adaptive eviction snapshot allocation failed: %s\n", cudaGetErrorString(alloc));
+                    return 1;
+                }
+            }
+            if (adapt_overlap_requested)
+                std::fprintf(stderr, "[admission-overlap] %s: mapped eviction snapshot, fixed one verifier window before blocking admission\n",
+                             adapt_overlap ? "enabled" : "disabled for this source/device configuration");
             if (dec_timing) (void) ver.profile_report(); // discard prompt/replay stamps before decode snapshots
             drive.d.diagnostic_work_hash = 14695981039346656037ull;
             drive.d.diagnostic_cpu_bytes = 0;
@@ -7090,6 +7142,18 @@ int main(int argc, char** argv) {
             const auto host_input0 = ver.host_stage_timing[0], host_ple0 = ver.host_stage_timing[1];
             double dt_run = 0, dt_commit = 0, dt_draft = 0;
             double dt_apply = 0, dt_adapt_join = 0, dt_apply_max = 0, dt_adapt_join_max = 0;
+            PendingTiming pending_timing;
+            double dt_eviction_upload = 0;
+            int64_t dec_deferred_applies = 0;
+            auto timed_apply_pending = [&](bool wait) {
+                const Clock::time_point begin = dec_timing ? Clock::now() : Clock::time_point{};
+                apply_pending(wait, dec_timing ? &pending_timing : nullptr);
+                const double elapsed = dec_timing ?
+                    std::chrono::duration<double, std::milli>(Clock::now() - begin).count() : 0.0;
+                dt_apply += elapsed;
+                dt_apply_max = std::max(dt_apply_max, elapsed);
+                return elapsed;
+            };
             int64_t dec_adapt_joins = 0;
             int64_t dec_windows = 0, dec_T = 0;
             int64_t dec_width[9] = {}; // bucket0 contains widths outside1..8
@@ -7130,12 +7194,26 @@ int main(int argc, char** argv) {
                 // #463: the previous adapt round's copies land first - with a non-blocking query, whether a swapped-in
                 // expert ran on the GPU or the CPU (they round differently) depended on the copy's timing
                 // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
-                const Clock::time_point apply0 = dec_timing ? Clock::now() : Clock::time_point{};
-                apply_pending(!adapt_nowait());
-                if (dec_timing) {
-                    const double elapsed = std::chrono::duration<double, std::milli>(Clock::now() - apply0).count();
-                    dt_apply += elapsed;
-                    dt_apply_max = std::max(dt_apply_max, elapsed);
+                const bool apply_after_verify = adapt_overlap && !pending.empty();
+                if (apply_after_verify) {
+                    // The refill stream may already overwrite these slots. Both CPU and GPU plans must see
+                    // their victims as nonresident for this entire window; incoming experts remain on CPU.
+                    const Clock::time_point publish0 = dec_timing ? Clock::now() : Clock::time_point{};
+                    std::memcpy(eviction_snapshot.get(), host_res.data(), host_res.size() * sizeof(int32_t));
+                    strata::kernels::copy_i32_from_mapped(d_res, mapped_evictions, (int64_t) host_res.size(), nullptr);
+                    // Finish the snapshot read and device publication before reusing it or replaying the
+                    // nonblocking verifier stream. The nonblocking refill stream remains independent.
+                    const cudaError_t publish = cudaStreamSynchronize(nullptr);
+                    if (publish != cudaSuccess) {
+                        std::printf("ERR publishing adaptive evictions failed: %s\n", cudaGetErrorString(publish));
+                        return 1;
+                    }
+                    if (dec_timing) {
+                        dt_eviction_upload += std::chrono::duration<double, std::milli>(Clock::now() - publish0).count();
+                        ++dec_deferred_applies;
+                    }
+                } else {
+                    timed_apply_pending(!adapt_nowait());
                 }
                 if (hist_n > 0) {
                     // the tails the penalties count over, ONE PER ROW: the tokens the state has consumed, the
@@ -7154,6 +7232,9 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
                 }
+                // Always publish after a complete verifier window, even if the copies finished earlier.
+                // This gives a fixed CPU/GPU placement schedule rather than a readiness-dependent query.
+                const double delayed_apply_ms = apply_after_verify ? timed_apply_pending(true) : 0.0;
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
@@ -7192,7 +7273,7 @@ int main(int argc, char** argv) {
                 {
                     const Clock::time_point tw3 = Clock::now();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
-                    dt_run += msd(tw0, tw1); dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
+                    dt_run += msd(tw0, tw1) - delayed_apply_ms; dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
                     ++dec_windows; dec_T += T;
                     ++dec_width[T >= 1 && T <= 8 ? T : 0];
                 }
@@ -7243,8 +7324,22 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata decode adaptation (ms/window): apply-pending %.3f join %.3f other %.3f; "
                                      "max apply/join %.3f/%.3f ms; joins %lld\n",
                              dt_apply / w, dt_adapt_join / w,
-                             (decode_ms - dt_run - dt_commit - dt_draft - dt_apply - dt_adapt_join) / w,
+                             (decode_ms - dt_run - dt_commit - dt_draft - dt_apply - dt_adapt_join - dt_eviction_upload) / w,
                              dt_apply_max, dt_adapt_join_max, (long long) dec_adapt_joins);
+                const double applies = (double) std::max((uint64_t) 1, pending_timing.applies);
+                std::fprintf(stderr, "strata decode admission phases (ms/window): ready %.3f unpin %.3f RAM-commit %.3f "
+                                     "residency %.3f upload %.3f; completed %llu swaps %llu logical-admission-bytes %llu; "
+                                     "ready/commit/upload per completed local apply %.3f/%.3f/%.3f ms\n",
+                             pending_timing.phase_ms[0] / w, pending_timing.phase_ms[1] / w,
+                             pending_timing.phase_ms[2] / w, pending_timing.phase_ms[3] / w,
+                             pending_timing.phase_ms[4] / w,
+                             (unsigned long long) pending_timing.applies, (unsigned long long) pending_timing.swaps,
+                             (unsigned long long) pending_timing.admission_bytes,
+                             pending_timing.phase_ms[0] / applies, pending_timing.phase_ms[2] / applies,
+                             pending_timing.phase_ms[4] / applies);
+                if (adapt_overlap)
+                    std::fprintf(stderr, "strata decode admission overlap: %lld deferred applies, eviction-upload %.3f ms/window\n",
+                                 (long long) dec_deferred_applies, dt_eviction_upload / w);
                 const char* host_timing_env = std::getenv("STRATA_HOST_STAGE_TIMING");
                 if (host_timing_env != nullptr && std::atoi(host_timing_env) != 0) {
                     const strata::core::Verifier::HostStageTiming baseline[2] = {host_input0, host_ple0};
