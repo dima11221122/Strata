@@ -32,6 +32,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
@@ -1108,12 +1109,128 @@ __global__ void native_q6_k_rowwarp_kernel(const Q6KBlock* __restrict__ w,
     }
 }
 
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+// Four consecutive original Q6 values. Blocks have only two-byte alignment.
+__device__ __forceinline__ unsigned q6_mma_word(const Q6KBlock* w, int col) {
+    const int region = col / 128, quarter = (col % 128) / 32, offset = col % 32;
+    const unsigned low = unsigned(load_int_b2(w->ql, (region * 64 + (quarter & 1) * 32 + offset) / 4));
+    const unsigned high = unsigned(load_int_b2(w->qh, (region * 32 + offset) / 4));
+    const unsigned values = ((low >> (4 * (quarter / 2))) & 0x0f0f0f0fu) |
+                            (((high >> (2 * quarter)) & 0x03030303u) << 4);
+    return unsigned(__vsubss4(int(values), 0x20202020));
+}
+
+template<int NCOLS>
+__launch_bounds__(WARPS * WARP, 2)
+__global__ void native_q6_k_int8_mma_kernel(const Q6KBlock* __restrict__ w,
+                                           const Q81Block* __restrict__ x,
+                                           float* __restrict__ y, int n_in, int n_out) {
+    const int lane = int(threadIdx.x), group = lane / 4, member = lane % 4;
+    const int row0 = (int(blockIdx.x) * WARPS + int(threadIdx.y)) * 16;
+    if (row0 >= n_out) return;  // warp-uniform, including the partial final tile
+    const int blocks_per_row = n_in / QK, x_stride = n_in / Q8K;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const int rows[2] = {row0 + group, row0 + group + 8};
+    const int cols[2] = {2 * member, 2 * member + 1};
+    float total[4] = {};
+    for (int kb = 0; kb < blocks_per_row; ++kb) {
+        const Q6KBlock* wa[2] = {
+            rows[0] < n_out ? w + std::size_t(rows[0]) * blocks_per_row + kb : nullptr,
+            rows[1] < n_out ? w + std::size_t(rows[1]) * blocks_per_row + kb : nullptr,
+        };
+        const float dw[2] = {wa[0] ? __half2float(wa[0]->d) : 0.f,
+                             wa[1] ? __half2float(wa[1]->d) : 0.f};
+#pragma unroll
+        for (int block32 = 0; block32 < 8; ++block32) {
+            int scaled[4] = {};
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const int chunk16 = 2 * block32 + half;
+                const int col = chunk16 * 16 + 4 * member;
+                const unsigned a0 = wa[0] ? q6_mma_word(wa[0], col) : 0u;
+                const unsigned a1 = wa[1] ? q6_mma_word(wa[1], col) : 0u;
+                unsigned b0 = 0;
+                if (group < NCOLS)
+                    b0 = unsigned(reinterpret_cast<const int*>(x[std::size_t(group) * x_stride + kb * 8 + block32].qs)
+                                  [4 * half + member]);
+                int dot[4] = {};
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 "
+                             "{%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};"
+                             : "+r"(dot[0]), "+r"(dot[1]), "+r"(dot[2]), "+r"(dot[3])
+                             : "r"(a0), "r"(a1), "r"(b0));
+                const int sc0 = wa[0] ? int(wa[0]->scales[chunk16]) : 0;
+                const int sc1 = wa[1] ? int(wa[1]->scales[chunk16]) : 0;
+                scaled[0] += dot[0] * sc0; scaled[1] += dot[1] * sc0;
+                scaled[2] += dot[2] * sc1; scaled[3] += dot[3] * sc1;
+            }
+#pragma unroll
+            for (int c = 0; c < 2; ++c) {
+                const float dx = cols[c] < NCOLS ?
+                    __low2float(x[std::size_t(cols[c]) * x_stride + kb * 8 + block32].ds) : 0.f;
+                total[c] += (dw[0] * dx) * float(scaled[c]);
+                total[c + 2] += (dw[1] * dx) * float(scaled[c + 2]);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < 2; ++r)
+#pragma unroll
+        for (int c = 0; c < 2; ++c)
+            if (rows[r] < n_out && cols[c] < NCOLS)
+                y[std::size_t(cols[c]) * n_out + rows[r]] = total[2 * r + c];
+#else
+    // A lower-architecture PTX build remains correct even on a newer physical device.
+    for (int r = 0; r < 16 && row0 + r < n_out; ++r) {
+        float acc[NCOLS] = {};
+        for (int kb = 0; kb < blocks_per_row; ++kb) {
+            const auto weight = Q6KTraits::load(w + std::size_t(row0 + r) * blocks_per_row + kb, lane);
+#pragma unroll
+            for (int c = 0; c < NCOLS; ++c)
+                acc[c] += Q6KTraits::apply(weight, x + std::size_t(c) * x_stride + kb * 8, lane);
+        }
+#pragma unroll
+        for (int c = 0; c < NCOLS; ++c) {
+            const float value = warp_sum(acc[c]);
+            if (lane == 0) y[std::size_t(c) * n_out + row0 + r] = value;
+        }
+    }
+#endif
+}
+
+bool q6_int8_mma_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_Q6_INT8_MMA");
+        return value != nullptr && std::atoi(value) != 0;
+    }();
+    if (!enabled) return false;
+    int device = 0, major = 0;
+    return cudaGetDevice(&device) == cudaSuccess &&
+           cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess && major >= 8;
+}
+#endif
+
 template<typename F, int NCOLS>
 void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
     const auto* w = static_cast<const typename F::Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
     bool compact_q6 = false;
     if constexpr (std::is_same_v<F, Q6KTraits>) {
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+        if (NCOLS >= 2 && n_in % QK == 0 && n_out >= 16 && q6_int8_mma_enabled()) {
+            static const bool reported = [] {
+                cudaFuncAttributes attr{};
+                const auto status = cudaFuncGetAttributes(&attr, native_q6_k_int8_mma_kernel<NCOLS>);
+                std::fprintf(stderr, "[q6-int8-mma] ncols=%d status=%d ptx=%d binary=%d mma=%d registers=%d\n",
+                             NCOLS, int(status), attr.ptxVersion, attr.binaryVersion,
+                             status == cudaSuccess && attr.ptxVersion >= 80, attr.numRegs);
+                return true;
+            }();
+            (void)reported;
+            const unsigned blocks = unsigned((std::size_t(n_out) + 16 * WARPS - 1) / (16 * WARPS));
+            native_q6_k_int8_mma_kernel<NCOLS><<<blocks, dim3(WARP, WARPS), 0, s>>>(w, x, y, n_in, n_out);
+            return;
+        }
+#endif
         static const bool rowwarp = [] {
             const char* value = std::getenv("STRATA_Q6_ROW_WARP");
             return value && std::atoi(value) != 0;
