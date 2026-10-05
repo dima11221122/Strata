@@ -5459,6 +5459,50 @@ int main(int argc, char** argv) {
         std::vector<void*> pin_live;   // the swaps' locked arena pages (pin_blob), unlocked once they have landed
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
+        static const bool layer_refill_requested = [] {
+            const char* v = std::getenv("STRATA_ADAPT_LAYER_REFILL");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        const bool layer_refill = layer_refill_requested && srcp == &arena_src && !multi_gpu && n_stages == 1 &&
+            stages.empty() && !peer.valid() && !remote_opt && !o.no_pool && d_res != nullptr &&
+            !o.spec_split && o.batch <= 1 && !adapt_nowait() && !drive.d.usage.empty() &&
+            strata::kernels::cpu::expert_layout().native &&
+            o.expert_cache_remote[0] <= 0 && o.expert_cache_remote[1] <= 0 && o.expert_cache_remote[2] <= 0;
+        if (layer_refill && !ver.enable_layer_refill(std::min((int) g.n_expert, o.adapt_swaps), err)) {
+            std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+            return 1;
+        }
+        if (layer_refill_requested)
+            std::fprintf(stderr, "[admission-layer-refill] %s: mapped copies after victim layer, blocking publication after window\n",
+                         layer_refill ? "enabled" : "disabled for this source/device configuration");
+        struct DeferredRefill { int32_t layer, in, out, slot; const uint8_t* source; };
+        // These records have not been admitted or represented by adapt_ev yet.
+        std::vector<DeferredRefill> layer_pending;
+        auto finish_layer_refill = [&](bool copied_in_window) -> bool {
+            if (layer_pending.empty()) return true;
+            for (const DeferredRefill& s : layer_pending) {
+                if (!copied_in_window && cudaMemcpyAsync(xcache.device_slot(s.slot), s.source,
+                        (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
+                        cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess) {
+                    // This fallback runs only between requests, after the last commit has completed.
+                    cudaStreamSynchronize(adapt_stream);
+                    std::fprintf(stderr, "strata serve: finishing deferred refill failed\n");
+                    return false;
+                }
+            }
+            if (cudaEventRecord(adapt_ev, adapt_stream) != cudaSuccess) {
+                cudaStreamSynchronize(adapt_stream);
+                std::fprintf(stderr, "strata serve: deferred refill event record failed\n");
+                return false;
+            }
+            for (const DeferredRefill& s : layer_pending) {
+                host_res[(size_t) s.layer * g.n_expert + s.out] = strata::core::kNotResident;
+                pending.emplace_back((int32_t) ((int64_t) s.layer * g.n_expert + s.in), s.slot);
+            }
+            layer_pending.clear();
+            ver.clear_layer_refill(); // run() joined every mapped copy before this table can be reused.
+            return true;
+        };
         // a layer split's later stages keep a copy of the residency table on their devices, and swap on their own
         auto res_upload = [&]() {
             if (d_res != nullptr)
@@ -5514,8 +5558,8 @@ int main(int argc, char** argv) {
             stamp(4);
         };
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
-        auto adapt = [&]() -> bool {
-            if (!pending.empty()) return true;   // the previous swaps are still in flight
+        auto adapt = [&](bool defer_to_layer = false) -> bool {
+            if (!pending.empty() || !layer_pending.empty()) return true;   // the previous swaps are still in flight
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
@@ -5558,6 +5602,17 @@ int main(int argc, char** argv) {
                 const int stn = multi_gpu ? stage_of(s.layer) : 0;   // the swap stays in the layer's own cache
                 GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
                 const strata::core::OnDevice on(gs ? gs->dev : -1);
+                if (defer_to_layer && slot >= 0 && b != nullptr) {
+                    if (const uint8_t* mapped = srcp->device_alias(s.layer, s.in)) {
+                        if (!ver.stage_layer_refill(s.layer, mapped, xcache.device_slot(slot))) {
+                            std::fprintf(stderr, "strata serve: invalid layer refill record\n");
+                            return false;
+                        }
+                        layer_pending.push_back({s.layer, s.in, s.out, slot, b});
+                        continue; // keep the victim resident throughout this verifier window.
+                    }
+                    // An unregistered blob uses the original DMA path between windows.
+                }
                 if (slot < 0 || b == nullptr ||
                     cudaMemcpyAsync(gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot), b,
                                     (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
@@ -5572,7 +5627,7 @@ int main(int argc, char** argv) {
                 srcp->prefetch(s.layer, s.out);   // a file-backed arena released its pages: read them back ahead
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
             }
-            if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
+            if (!swaps.empty() && !pending.empty()) cudaEventRecord(adapt_ev, adapt_stream);
             (void) main_live;
             for (auto& st : stages)
                 if (st->adapt_live) {
@@ -7096,7 +7151,7 @@ int main(int argc, char** argv) {
                 return v != nullptr && std::atoi(v) != 0;
             }();
             // Only the arena's immutable CPU copy and one local cache participate in this experiment.
-            const bool adapt_overlap = adapt_overlap_requested && srcp == &arena_src && !multi_gpu &&
+            const bool adapt_overlap = adapt_overlap_requested && !layer_refill && srcp == &arena_src && !multi_gpu &&
                 stages.empty() && !peer.valid() && !remote_opt && !o.no_pool && d_res != nullptr &&
                 o.expert_cache_remote[0] <= 0 && o.expert_cache_remote[1] <= 0 && o.expert_cache_remote[2] <= 0;
             // A copy-engine table upload queues behind the large adaptive H2D refills. Publish this
@@ -7197,6 +7252,7 @@ int main(int argc, char** argv) {
                 // expert ran on the GPU or the CPU (they round differently) depended on the copy's timing
                 // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
                 const bool apply_after_verify = adapt_overlap && !pending.empty();
+                const bool refill_after_verify = !layer_pending.empty();
                 if (apply_after_verify) {
                     // The refill stream may already overwrite these slots. Both CPU and GPU plans must see
                     // their victims as nonresident for this entire window; incoming experts remain on CPU.
@@ -7234,9 +7290,10 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
                 }
+                if (refill_after_verify && !finish_layer_refill(true)) return 1;
                 // Always publish after a complete verifier window, even if the copies finished earlier.
                 // This gives a fixed CPU/GPU placement schedule rather than a readiness-dependent query.
-                const double delayed_apply_ms = apply_after_verify ? timed_apply_pending(true) : 0.0;
+                const double delayed_apply_ms = apply_after_verify || refill_after_verify ? timed_apply_pending(true) : 0.0;
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
@@ -7244,7 +7301,7 @@ int main(int argc, char** argv) {
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
                 if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
-                    adapt_thr = std::thread([&] { adapt_ok = adapt(); });
+                    adapt_thr = std::thread([&] { adapt_ok = adapt(layer_refill); });
                 if (!ver.commit(a + 1, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
@@ -7313,6 +7370,12 @@ int main(int argc, char** argv) {
             if (!ver.wait_commit(err)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
+            }
+            // EOS, cancellation or the context limit may leave a prepared batch with no next window.
+            // No verifier is active here; finish it by ordinary DMA before prompt loans or cache changes.
+            if (!layer_pending.empty()) {
+                if (!finish_layer_refill(false)) return 1;
+                apply_pending(true);
             }
             if (dec_timing && dec_windows > 0) {
                 const DecSnap d1 = dec_snap();

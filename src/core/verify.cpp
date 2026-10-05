@@ -377,6 +377,7 @@ Verifier::~Verifier() {
     if (cs_) cudaStreamSynchronize(cs_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
     if (fetch_cs_) cudaStreamSynchronize(fetch_cs_);
+    if (refill_cs_) cudaStreamSynchronize(refill_cs_);
     for (auto& e : exec_)
         if (e) cudaGraphExecDestroy(e);
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
@@ -389,17 +390,66 @@ Verifier::~Verifier() {
     if (cs_) cudaStreamDestroy(cs_);
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
     if (fetch_cs_) cudaStreamDestroy(fetch_cs_);
+    if (refill_cs_) cudaStreamDestroy(refill_cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (commit_done_) cudaEventDestroy(commit_done_);
     if (ev_fork_) cudaEventDestroy(ev_fork_);
     if (ev_join_) cudaEventDestroy(ev_join_);
     if (ev_fetch_fork_) cudaEventDestroy(ev_fetch_fork_);
     if (ev_fetch_join_) cudaEventDestroy(ev_fetch_join_);
+    if (ev_refill_fork_) cudaEventDestroy(ev_refill_fork_);
+    if (ev_refill_join_) cudaEventDestroy(ev_refill_join_);
+    if (refill_host_) cudaFreeHost(refill_host_);
     if (arena_) cudaFree(arena_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
                      h_flagA_, h_plan_, h_flagB_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
+}
+
+bool Verifier::enable_layer_refill(int capacity, std::string& err) {
+    if (g_ == nullptr || capacity <= 0 || capacity > (int) g_->n_expert || split_ || next_ != nullptr ||
+        lb_ != 0 || le_ != g_->n_layers || refill_host_ != nullptr ||
+        std::any_of(std::begin(exec_), std::end(exec_), [](cudaGraphExec_t e) { return e != nullptr; })) {
+        err = "verify: layer refill requires an uncaptured, unsplit local verifier";
+        return false;
+    }
+    const size_t stride = 8 + (size_t) capacity * 2 * sizeof(unsigned long long);
+    if (cudaHostAlloc(&refill_host_, (size_t) g_->n_layers * stride, cudaHostAllocMapped) != cudaSuccess ||
+        cudaHostGetDevicePointer((void**) &refill_mapped_, refill_host_, 0) != cudaSuccess ||
+        cudaStreamCreateWithFlags(&refill_cs_, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaEventCreateWithFlags(&ev_refill_fork_, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&ev_refill_join_, cudaEventDisableTiming) != cudaSuccess) {
+        err = "verify: layer refill allocation/stream/event failed";
+        return false;
+    }
+    refill_capacity_ = capacity;
+    clear_layer_refill();
+    return true;
+}
+
+void Verifier::clear_layer_refill() {
+    if (refill_host_ == nullptr) return;
+    const size_t stride = 8 + (size_t) refill_capacity_ * 2 * sizeof(unsigned long long);
+    for (int64_t l = 0; l < g_->n_layers; ++l) {
+        auto* counts = (int32_t*) ((uint8_t*) refill_host_ + (size_t) l * stride);
+        counts[0] = 0;
+        counts[1] = 1; // fetch_blobs indexed destinations
+    }
+}
+
+bool Verifier::stage_layer_refill(int64_t layer, const uint8_t* mapped_source, uint8_t* destination) {
+    if (refill_host_ == nullptr || layer < 0 || layer >= g_->n_layers || !mapped_source || !destination ||
+        ((uintptr_t) mapped_source & 15u) != 0 || ((uintptr_t) destination & 15u) != 0) return false;
+    const size_t stride = 8 + (size_t) refill_capacity_ * 2 * sizeof(unsigned long long);
+    auto* counts = (int32_t*) ((uint8_t*) refill_host_ + (size_t) layer * stride);
+    if (counts[0] >= refill_capacity_) return false;
+    auto* sources = (unsigned long long*) (counts + 2);
+    auto* destinations = sources + refill_capacity_;
+    sources[counts[0]] = (unsigned long long) mapped_source;
+    destinations[counts[0]] = (unsigned long long) destination;
+    ++counts[0];
+    return true;
 }
 
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
@@ -1261,6 +1311,21 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     for (int64_t l = lb_; l < le_; ++l)
         for (int grp = 0; grp < G; ++grp) {
             if (!post(l, grp)) return false;
+            if (refill_cs_ != nullptr && !batch_rec_) {
+                // post joined resident, PCIe and shared expert reads of this layer's slots.
+                // All later layers use disjoint cache slots; no host CUDA call occurs in the handshake.
+                if (G != 1 || cudaEventRecord(ev_refill_fork_, cs) != cudaSuccess ||
+                    cudaStreamWaitEvent(refill_cs_, ev_refill_fork_, 0) != cudaSuccess) {
+                    err = "verify: layer refill fork failed";
+                    return false;
+                }
+                const size_t stride = 8 + (size_t) refill_capacity_ * 2 * sizeof(unsigned long long);
+                const auto* counts = (const int32_t*) (refill_mapped_ + (size_t) l * stride);
+                const auto* sources = (const unsigned long long*) (counts + 2);
+                const auto* destinations = sources + refill_capacity_;
+                fetch_blobs(sources, counts, nullptr, (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(l),
+                            refill_capacity_, refill_cs_, destinations, counts + 1);
+            }
             if (l + 1 < le_ && !pre(l + 1, grp)) return false;
         }
     if (le_ < g.n_layers) {   // a layer split's earlier stage: hand the residual on, no head
@@ -1324,6 +1389,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
     }
     stamp(g.n_layers, 1, 0);
+    if (refill_cs_ != nullptr && !batch_rec_) {
+        if (cudaEventRecord(ev_refill_join_, refill_cs_) != cudaSuccess ||
+            cudaStreamWaitEvent(cs, ev_refill_join_, 0) != cudaSuccess) {
+            err = "verify: layer refill join failed";
+            return false;
+        }
+    }
     return true;
 }
 

@@ -82,6 +82,11 @@ public:
     /// One window: `tokens[0..T)` at positions pos0.., the pool served per layer; `out[t]` = argmax after token t.
     /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
+    /// Experimental layer-safe cache refills. Enable before the first capture, only for one unsplit stage.
+    /// Stage mapped immutable sources between windows; run() joins every refill before returning.
+    bool enable_layer_refill(int capacity, std::string& err);
+    bool stage_layer_refill(int64_t layer, const uint8_t* mapped_source, uint8_t* destination);
+    void clear_layer_refill();
     /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
     bool copy_logits(int t, float* host) const;
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
@@ -309,6 +314,11 @@ private:
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
     cudaStream_t fetch_cs_ = nullptr; // STRATA_VERIFY_FETCH_OVERLAP, mapped staging only
     cudaEvent_t ev_fetch_fork_ = nullptr, ev_fetch_join_ = nullptr;
+    cudaStream_t refill_cs_ = nullptr;
+    cudaEvent_t ev_refill_fork_ = nullptr, ev_refill_join_ = nullptr;
+    void* refill_host_ = nullptr;
+    uint8_t* refill_mapped_ = nullptr;
+    int refill_capacity_ = 0;
     cudaGraphExec_t exec_[9] = {};
     cudaGraphExec_t commit_exec_ = nullptr;
 

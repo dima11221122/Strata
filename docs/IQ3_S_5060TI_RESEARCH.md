@@ -340,6 +340,14 @@ The original target verifier, draft count/confidence, model precision and cache 
 
 The basic bracket completed at 21:55 UTC: controls 69.0/67.5/69.0 and 68.3/67.0/68.1, candidate 67.3/65.3/68.2 tokens/s. Warm means were 68.25/66.75/67.55. Candidate activation was verified; cache capacity stayed 4601 slots, and all corresponding answer hashes and draft totals matched. The throughput gate failed, so this candidate remains disabled. No full benchmark or regression followed; these basic replays are excluded from the full-run ledger.
 
+### Layer-safe mapped adaptive refills
+
+`STRATA_ADAPT_LAYER_REFILL=1` is a default-off admission experiment. It preserves the existing swap ranking and budget but keeps victims resident for one more verifier window. After each layer's resident, PCIe and shared expert work completes, a captured refill stream uses the existing indexed whole-blob fetch kernel to overwrite only that layer's victim slots. The stream joins after the head. Incoming experts are published with blocking admission after the complete window, independent of copy-readiness queries. No original weight bytes or expert precision change, and no extra expert cache is allocated.
+
+The candidate requires the immutable arena source, one unsplit local stage, no peer or remote expert cache, a native CPU pool and blocking admission. Per-blob mapped aliases, capacity and pointer alignment are checked. Unmapped sources use ordinary DMA between windows. Prepared refills stay separate from submitted `pending` admissions; a request ending before its next window flushes them by DMA after the last commit, before prompt loans or cache resizing.
+
+A proposed host-copy wrapper was rejected because this source documents prior driver-lock hangs when `cudaMemcpyAsync` ran during the CPU/GPU flag handshake. This implementation adds no host CUDA call during that handshake. Its stream capture follows [CUDA's fork/join dependencies](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html). Extra empty launches and SM/PCIe contention may erase the overlap benefit. The engine-only build succeeded at 22:14 UTC, SHA256 `3378aa4130f6a3fa4e5ff446f5c43809f9d434b0fed33fb652a41103b625c3a7`. Scoped implementation review found no issues; the basic control/candidate/control bracket started at 22:18 UTC. Runtime/HIP, numerical quality and speed remain unverified; no regression has run.
+
 ### Earlier validation
 
 The initial CUDA 13, SM 120 build completed. Of 75 registered CTest cases, 73 passed. `ple_parity` lacked its relative Q2_0 GGUF fixture; `expert_multi_test` requires AVX-512 VNNI/VBMI unavailable on this EPYC. These two failures are reported rather than hidden. The IQ3_S runtime uses the supported AVX2 path.
