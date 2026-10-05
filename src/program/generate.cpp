@@ -7212,6 +7212,9 @@ int main(int argc, char** argv) {
             int64_t dec_adapt_joins = 0;
             int64_t dec_windows = 0, dec_T = 0;
             int64_t dec_width[9] = {}; // bucket0 contains widths outside1..8
+            int64_t dec_mtp_verified[9] = {}, dec_mtp_accepted[9] = {};
+            int64_t dec_mtp_rounds[9] = {}, dec_mtp_tokens[9] = {};
+            double dec_mtp_round_ms[9] = {};
             const int64_t decode_hits0 = drive.d.cache_hits;
             // CS-T: the RAM and file tiers of this request (the mmap source; 0 with the arena)
             const int64_t ram0 = src.ram_reads(), files0 = src.file_reads();
@@ -7356,6 +7359,18 @@ int main(int argc, char** argv) {
                 }
                 if (timed_round && !eos) {
                     const double round_ms = std::chrono::duration<double, std::milli>(Clock::now() - round0).count();
+                    // Complete MTP rounds only: exclude lookup, first and truncated terminal rounds.
+                    // Position p is a proposed token, numbered1..T-1; acceptance is a committed prefix.
+                    if (dec_timing && !from_sfx && produced_n < max_new) {
+                        const int width = T >= 1 && T <= 8 ? T : 0;
+                        ++dec_mtp_rounds[width];
+                        dec_mtp_tokens[width] += a + 1;
+                        dec_mtp_round_ms[width] += round_ms;
+                        for (int pos = 1; pos < T && pos <= 8; ++pos) {
+                            ++dec_mtp_verified[pos];
+                            if (a >= pos) ++dec_mtp_accepted[pos];
+                        }
+                    }
                     policy.observe(from_sfx, T, a, sfx_match,
                                    round_ms);
                     if (!from_sfx && produced_n < max_new) policy.observe_mtp(mtp_cap, T, a, round_ms);
@@ -7380,6 +7395,13 @@ int main(int argc, char** argv) {
             if (dec_timing && dec_windows > 0) {
                 const DecSnap d1 = dec_snap();
                 const double w = (double) dec_windows, L = (double) g.n_layers;
+                for (int pos = 1; pos <= 8; ++pos) if (dec_mtp_verified[pos] > 0)
+                    std::fprintf(stderr, "strata decode MTP prefix: position %d verified %lld accepted %lld\n",
+                                 pos, (long long) dec_mtp_verified[pos], (long long) dec_mtp_accepted[pos]);
+                for (int width = 0; width <= 8; ++width) if (dec_mtp_rounds[width] > 0)
+                    std::fprintf(stderr, "strata decode MTP rounds: width %d rounds %lld emitted %lld total-ms %.3f\n",
+                                 width, (long long) dec_mtp_rounds[width], (long long) dec_mtp_tokens[width],
+                                 dec_mtp_round_ms[width]);
                 std::fprintf(stderr, "strata decode timing: %lld windows, avg T %.2f, %.2f tokens/window, %.2f ms/window = "
                                      "verify %.2f (GPU-reach wait %.2f + per-layer host %.2f [plan %.2f actq %.2f jobs %.2f "
                                      "CPU %.2f]; staging %.2f overlaps host) + commit/emit %.2f + draft %.2f; per layer-window: CPU experts "

@@ -31,6 +31,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -87,6 +88,13 @@ struct Q6KBlock {
     int8_t scales[16];
     half d;
 };
+struct alignas(4) Q6KAlignedBlock {
+    uint32_t ql[32];
+    uint32_t qh[16];
+    int8_t scales[16];
+    half d;
+    uint16_t padding;
+};
 struct Q40Block {
     half d;
     uint8_t qs[16];
@@ -119,6 +127,9 @@ static_assert(sizeof(Q4KBlock) == 144 && alignof(Q4KBlock) == 4 &&
 static_assert(sizeof(Q6KBlock) == 210 && alignof(Q6KBlock) == 2 &&
               offsetof(Q6KBlock, qh) == 128 && offsetof(Q6KBlock, scales) == 192 &&
               offsetof(Q6KBlock, d) == 208);
+static_assert(sizeof(Q6KAlignedBlock) == 212 && alignof(Q6KAlignedBlock) == 4 &&
+              offsetof(Q6KAlignedBlock, qh) == 128 && offsetof(Q6KAlignedBlock, scales) == 192 &&
+              offsetof(Q6KAlignedBlock, d) == 208);
 static_assert(sizeof(Q40Block) == 18 && alignof(Q40Block) == 2 && offsetof(Q40Block, qs) == 2);
 static_assert(sizeof(Q50Block) == 22 && alignof(Q50Block) == 2 &&
               offsetof(Q50Block, qh) == 2 && offsetof(Q50Block, qs) == 6);
@@ -637,13 +648,19 @@ __device__ __forceinline__ float q6_q8_dot_impl(int vl, int vh, const int* __res
     return d * sumf;
 }
 
-__device__ __forceinline__ float q6_q8_dot(const Q6KBlock* __restrict__ w,
+__device__ __forceinline__ int q6_low_word(const Q6KBlock* w, int i) { return load_int_b2(w->ql, i); }
+__device__ __forceinline__ int q6_high_word(const Q6KBlock* w, int i) { return load_int_b2(w->qh, i); }
+__device__ __forceinline__ int q6_low_word(const Q6KAlignedBlock* w, int i) { return int(w->ql[i]); }
+__device__ __forceinline__ int q6_high_word(const Q6KAlignedBlock* w, int i) { return int(w->qh[i]); }
+
+template<typename Block>
+__device__ __forceinline__ float q6_q8_dot(const Block* __restrict__ w,
                                           const Q81Block* __restrict__ x, int iqs) {
     const int bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;
     const int scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
     const int vh_shift = 2 * ((iqs % 16) / 8);
-    const int vl = load_int_b2(w->ql, iqs);
-    const int vh = load_int_b2(w->qh, 8 * (iqs / 16) + iqs % 8) >> vh_shift;
+    const int vl = q6_low_word(w, iqs);
+    const int vh = q6_high_word(w, 8 * (iqs / 16) + iqs % 8) >> vh_shift;
     int u[2];
     float d8[2];
 #pragma unroll
@@ -655,9 +672,9 @@ __device__ __forceinline__ float q6_q8_dot(const Q6KBlock* __restrict__ w,
 }
 
 // Q6_K generic MMVQ: QK=256, QI=32, VDR=1, four blocks per iteration.
-template<bool SmallK>
+template<bool SmallK, typename Block = Q6KBlock>
 __launch_bounds__(WARPS * WARP, 1)
-__global__ void native_q6_k_mmvq_kernel(const Q6KBlock* __restrict__ w,
+__global__ void native_q6_k_mmvq_kernel(const Block* __restrict__ w,
                                         const Q81Block* __restrict__ x,
                                         float* __restrict__ y, int n_in, int n_out) {
     constexpr int ROWS = SmallK ? WARPS : 1;
@@ -690,6 +707,23 @@ __global__ void native_q6_k_mmvq_kernel(const Q6KBlock* __restrict__ w,
         for (int l = 0; l < WARPS - 1; ++l) tmp[i] += partial[l][i][threadIdx.x];
         tmp[i] = warp_sum(tmp[i]);
         if (threadIdx.x == i && row0 + i < n_out) y[row0 + i] = tmp[i];
+    }
+}
+
+__global__ void q6_gather_aligned_kernel(const Q6KBlock* __restrict__ source,
+                                         const int* __restrict__ row_ids,
+                                         Q6KAlignedBlock* __restrict__ destination,
+                                         int blocks_per_row, std::size_t count) {
+    for (std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < count; i += std::size_t(gridDim.x) * blockDim.x) {
+        const std::size_t row = i / blocks_per_row, block = i % blocks_per_row;
+        const Q6KBlock* w = source + std::size_t(row_ids[row]) * blocks_per_row + block;
+        Q6KAlignedBlock* out = destination + i;
+        for (int j = 0; j < 32; ++j) out->ql[j] = uint32_t(load_int_b2(w->ql, j));
+        for (int j = 0; j < 16; ++j) out->qh[j] = uint32_t(load_int_b2(w->qh, j));
+        for (int j = 0; j < 16; ++j) out->scales[j] = w->scales[j];
+        out->d = w->d;
+        out->padding = 0;
     }
 }
 
@@ -1659,6 +1693,42 @@ void native_q4_k_f32(const void* weights, const float* x, void* scratch_q8_1,
     validate_stream(stream);
     native_quantize_q8_1(x, scratch_q8_1, n_in, ncols, stream);
     native_q4_k_mmvq(weights, scratch_q8_1, y, n_in, n_out, ncols, stream);
+}
+
+std::size_t native_q6_k_aligned_bytes(int n_in, int n_out) {
+    validate_shape(n_in, 1, QK);
+    if (n_out <= 0) throw std::invalid_argument("aligned Q6 head requires n_out > 0");
+    const std::size_t blocks = std::size_t(n_in / QK) * std::size_t(n_out);
+    if (blocks > std::numeric_limits<std::size_t>::max() / sizeof(Q6KAlignedBlock))
+        throw std::overflow_error("aligned Q6 head byte count overflows");
+    return blocks * sizeof(Q6KAlignedBlock);
+}
+
+void native_q6_k_gather_aligned(const void* weights, const int* row_ids, void* aligned,
+                                int n_in, int n_out, void* stream) {
+    const std::size_t count = native_q6_k_aligned_bytes(n_in, n_out) / sizeof(Q6KAlignedBlock);
+    validate_pointer(weights); validate_pointer(row_ids); validate_pointer(aligned); validate_stream(stream);
+    const unsigned grid = unsigned(std::min<std::size_t>((count + 255) / 256, 4096));
+    q6_gather_aligned_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const Q6KBlock*>(weights), row_ids, static_cast<Q6KAlignedBlock*>(aligned), n_in / QK, count);
+    launch_check();
+}
+
+void native_q6_k_aligned_mmvq(const void* aligned, const void* x_q8_1, float* y,
+                              int n_in, int n_out, void* stream) {
+    native_q6_k_aligned_bytes(n_in, n_out);
+    validate_pointer(aligned); validate_pointer(x_q8_1); validate_pointer(y); validate_stream(stream);
+    const auto* w = static_cast<const Q6KAlignedBlock*>(aligned);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const auto s = static_cast<cudaStream_t>(stream);
+    const dim3 threads(WARP, WARPS);
+    if (n_in / QK < WARPS) {
+        const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+        native_q6_k_mmvq_kernel<true, Q6KAlignedBlock><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out);
+    } else {
+        native_q6_k_mmvq_kernel<false, Q6KAlignedBlock><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out);
+    }
+    launch_check();
 }
 
 void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,

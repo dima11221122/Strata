@@ -85,6 +85,16 @@ void native_q4_k_f32(const void* weights, const float* x, void* scratch_q8_1,
 void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream);
 
+// Internal CUDA draft-head probe: original Q6 bits/scales with two padding bytes per
+// block. Gather validated vocabulary row IDs directly from the original head;
+// no temporary weight copy. The aligned MMVQ keeps the generic single-column
+// launch/reduction and does not apply experimental rowwarp overrides.
+std::size_t native_q6_k_aligned_bytes(int n_in, int n_out);
+void native_q6_k_gather_aligned(const void* weights, const int* row_ids, void* aligned,
+                                int n_in, int n_out, void* stream);
+void native_q6_k_aligned_mmvq(const void* aligned, const void* x_q8_1, float* y,
+                              int n_in, int n_out, void* stream);
+
 void native_q6_k_f32(const void* weights, const float* x, void* scratch_q8_1,
                      float* y, int n_in, int n_out, int ncols, void* stream);
 

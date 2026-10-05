@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -62,6 +63,20 @@ bool accepted_catchup() {
         return on;
     }();
     return enabled;
+}
+
+bool aligned_draft_head() {
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+    // HIP's original Q6 dispatch can use a wave64 layout; this bounded CUDA
+    // probe must preserve the original single-column reduction geometry.
+    return false;
+#else
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_MTP_Q6_ALIGNED");
+        return value && std::atoi(value) != 0;
+    }();
+    return enabled;
+#endif
 }
 
 struct Bump {
@@ -352,7 +367,12 @@ uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const 
             std::fseek(f, 0, SEEK_END);
             const long size = std::ftell(f);
             std::fclose(f);
-            if (size >= 4 && size % 4 == 0) bytes += (uint64_t) (size / 4) * head_row_bytes + (uint64_t) size;
+            if (size >= 4 && size % 4 == 0) {
+                // Among supported formats, this row size identifies Q6_K for the same input dimension.
+                if (aligned_draft_head() && g_ && head_row_bytes == (uint64_t) (g_->n_embd / 256) * 210)
+                    head_row_bytes = strata::kernels::native_q6_k_aligned_bytes((int) g_->n_embd, 1);
+                bytes += (uint64_t) (size / 4) * head_row_bytes + (uint64_t) size;
+            }
         }
     }
     // coupled draft sampling (STRATA_SPEC_COUPLED=1 only): an upper bound - the id -> subset map, the penalty ring,
@@ -475,18 +495,51 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
         if (read_file(rt_dir_ + "/draft_vocab.bin", raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
             n_dvocab_ = (int64_t) (raw.size() / 4);
             const int64_t row_bytes = (int64_t) head->row_bytes();   // a vocabulary row of the native head
+            const bool aligned = aligned_draft_head() && head->type() == 14;
+            uint64_t head_bytes = (uint64_t) (n_dvocab_ * row_bytes);
+            if (aligned) {
+                const char* single = std::getenv("STRATA_Q6_ROW_WARP_SINGLE");
+                if (n_dvocab_ > INT_MAX || (single && std::atoi(single) != 0)) {
+                    err = "mtp: aligned Q6 head requires int32 rows and the generic single-column layout";
+                    return false;
+                }
+                for (size_t i = 0; i < raw.size(); i += sizeof(int32_t)) {
+                    int32_t id;
+                    std::memcpy(&id, raw.data() + i, sizeof(id));
+                    if (id < 0 || id >= n_vocab_) { err = "mtp: aligned Q6 head vocabulary id out of range"; return false; }
+                }
+                head_bytes = strata::kernels::native_q6_k_aligned_bytes((int) g_->n_embd, (int) n_dvocab_);
+            }
             if (cudaMalloc((void**) &dvocab_, raw.size()) != cudaSuccess ||
-                cudaMalloc((void**) &dhead_, (size_t) (n_dvocab_ * row_bytes)) != cudaSuccess) {
+                cudaMalloc((void**) &dhead_, head_bytes) != cudaSuccess) {
                 err = "mtp: the draft head does not fit";
                 draft_head_hint(n_dvocab_, row_bytes);
                 return false;
             }
-            cudaMemcpy(dvocab_, raw.data(), raw.size(), cudaMemcpyHostToDevice);
-            strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
-            cudaDeviceSynchronize();
-            vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
+            if (aligned) {
+                if (cudaMemcpyAsync(dvocab_, raw.data(), raw.size(), cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+                    cudaStreamSynchronize(cs_);
+                    err = "mtp: aligned Q6 vocabulary upload failed"; return false;
+                }
+                try {
+                    strata::kernels::native_q6_k_gather_aligned(head->weights(), dvocab_, dhead_,
+                        (int) g_->n_embd, (int) n_dvocab_, cs_);
+                } catch (const std::exception& e) {
+                    cudaStreamSynchronize(cs_);   // raw vocabulary remains alive through submitted work
+                    err = std::string("mtp: aligned Q6 gather: ") + e.what(); return false;
+                }
+                if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: aligned Q6 gather failed"; return false; }
+                dhead_aligned_ = true;
+                std::fprintf(stderr, "[mtp-q6-aligned] block_bytes=212 rows=%lld bytes=%llu\n",
+                    (long long) n_dvocab_, (unsigned long long) head_bytes);
+            } else {
+                cudaMemcpy(dvocab_, raw.data(), raw.size(), cudaMemcpyHostToDevice);
+                strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
+                cudaDeviceSynchronize();
+            }
+            vram_ += head_bytes + raw.size();
             std::fprintf(stderr, "strata mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
-                         (double) (n_dvocab_ * row_bytes) / 1048576.0);
+                         (double) head_bytes / 1048576.0);
         }
     }
     if (coupled_draft_env() && cparams_ == nullptr && !setup_coupled(err)) return false;
@@ -670,7 +723,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
         const bool sub = dhead_ != nullptr;
         const int64_t nv = sub ? n_dvocab_ : n_vocab_;
-        native_mmvq(head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
+        if (dhead_aligned_) native_q6_k_aligned_mmvq(dhead_, xq_, head_logits_, (int) N, (int) nv, cs);
+        else native_mmvq(head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
         if (coupled_rec_) {
             // coupled draft sampling: the target's chain and Philox draw for the row that will verify this draft
             // (counter = this cell + 1, from its step record), penalties over the ring; T == 1 (full layer)
