@@ -7085,6 +7085,7 @@ int main(int argc, char** argv) {
             };
             const DecSnap ds0 = dec_snap();
             const auto task_timing0 = pool.native_task_timing();
+            const auto host_input0 = ver.host_stage_timing[0], host_ple0 = ver.host_stage_timing[1];
             double dt_run = 0, dt_commit = 0, dt_draft = 0;
             int64_t dec_windows = 0, dec_T = 0;
             int64_t dec_width[9] = {}; // bucket0 contains widths outside1..8
@@ -7213,13 +7214,28 @@ int main(int argc, char** argv) {
                 const double w = (double) dec_windows, L = (double) g.n_layers;
                 std::fprintf(stderr, "strata decode timing: %lld windows, avg T %.2f, %.2f tokens/window, %.2f ms/window = "
                                      "verify %.2f (GPU-reach wait %.2f + per-layer host %.2f [plan %.2f actq %.2f jobs %.2f "
-                                     "CPU %.2f] + stage %.2f) + commit/emit %.2f + draft %.2f; per layer-window: CPU experts "
+                                     "CPU %.2f]; staging %.2f overlaps host) + commit/emit %.2f + draft %.2f; per layer-window: CPU experts "
                                      "%.2f (%.2f entries), VRAM hits %.2f, PCIe %.2f\n",
                              (long long) dec_windows, dec_T / w, produced_n / w, decode_ms / w, dt_run / w,
                              (d1.wait - ds0.wait) / w, (d1.pool - ds0.pool) / w, (d1.plan - ds0.plan) / w,
                              (d1.actq - ds0.actq) / w, (d1.jobs - ds0.jobs) / w, (d1.run - ds0.run) / w,
                              (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
-                             (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L));
+                              (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L));
+                const char* host_timing_env = std::getenv("STRATA_HOST_STAGE_TIMING");
+                if (host_timing_env != nullptr && std::atoi(host_timing_env) != 0) {
+                    const strata::core::Verifier::HostStageTiming baseline[2] = {host_input0, host_ple0};
+                    for (int stage = 0; stage < 2; ++stage) {
+                        const auto& after = ver.host_stage_timing[stage];
+                        const auto& before = baseline[stage];
+                        std::fprintf(stderr, "strata decode host stage %s: wall/CPU %.3f/%.3f ms/window; minor/major faults %llu/%llu; resource samples %llu/%llu\n",
+                                     stage == 0 ? "inputs" : "PLE collect", (after.wall_ms - before.wall_ms) / w,
+                                     (after.cpu_ms - before.cpu_ms) / w,
+                                     (unsigned long long) (after.minor_faults - before.minor_faults),
+                                     (unsigned long long) (after.major_faults - before.major_faults),
+                                     (unsigned long long) (after.resource_samples - before.resource_samples),
+                                     (unsigned long long) (after.samples - before.samples));
+                    }
+                }
                 const std::string pr = ver.profile_report();
                 std::fprintf(stderr, "strata decode CPU phases (ms/window): gate/up %.2f quantize %.2f down %.2f pipeline %.2f\n",
                              (d1.gu - ds0.gu) / w, (d1.hq - ds0.hq) / w, (d1.down - ds0.down) / w,
@@ -7228,24 +7244,27 @@ int main(int argc, char** argv) {
                 if (phase_env != nullptr && std::atoi(phase_env) != 0) {
                     std::fprintf(stderr, "strata decode CPU pool (ms/window): pre-park %.2f drain-and-completion %.2f re-park %.2f\n",
                                  (d1.park - ds0.park) / w, (d1.drain - ds0.drain) / w, (d1.repark - ds0.repark) / w);
-                    const auto task_timing = pool.native_task_timing();
-                    std::fprintf(stderr, "strata decode CPU pool tasks: GU/down finish tails %.2f/%.2f ms/window; sampled execution wall/CPU %.2f/%.2f ms over %llu tasks\n",
-                                 (task_timing.tail_ms[0] - task_timing0.tail_ms[0]) / w,
-                                 (task_timing.tail_ms[1] - task_timing0.tail_ms[1]) / w,
-                                 task_timing.sample_wall_ms - task_timing0.sample_wall_ms,
-                                 task_timing.sample_cpu_ms - task_timing0.sample_cpu_ms,
-                                 (unsigned long long) (task_timing.samples - task_timing0.samples));
-                    std::fprintf(stderr, "strata decode CPU pool task means (us,count) by max input group:");
-                    for (int nt = 0; nt <= 8; ++nt) {
-                        const uint64_t count = task_timing.tasks[nt] - task_timing0.tasks[nt];
-                        const double ms = task_timing.task_wall_ms[nt] - task_timing0.task_wall_ms[nt];
-                        std::fprintf(stderr, " %d:%.2f,%llu", nt, count ? ms * 1000.0 / count : 0,
-                                     (unsigned long long) count);
+                    const char* task_env = std::getenv("STRATA_POOL_TASK_TIMING");
+                    if (task_env != nullptr && std::atoi(task_env) != 0) {
+                        const auto task_timing = pool.native_task_timing();
+                        std::fprintf(stderr, "strata decode CPU pool tasks: GU/down finish tails %.2f/%.2f ms/window; sampled execution wall/CPU %.2f/%.2f ms over %llu tasks\n",
+                                     (task_timing.tail_ms[0] - task_timing0.tail_ms[0]) / w,
+                                     (task_timing.tail_ms[1] - task_timing0.tail_ms[1]) / w,
+                                     task_timing.sample_wall_ms - task_timing0.sample_wall_ms,
+                                     task_timing.sample_cpu_ms - task_timing0.sample_cpu_ms,
+                                     (unsigned long long) (task_timing.samples - task_timing0.samples));
+                        std::fprintf(stderr, "strata decode CPU pool task means (us,count) by max input group:");
+                        for (int nt = 0; nt <= 8; ++nt) {
+                            const uint64_t count = task_timing.tasks[nt] - task_timing0.tasks[nt];
+                            const double ms = task_timing.task_wall_ms[nt] - task_timing0.task_wall_ms[nt];
+                            std::fprintf(stderr, " %d:%.2f,%llu", nt, count ? ms * 1000.0 / count : 0,
+                                         (unsigned long long) count);
+                        }
+                        std::fputc('\n', stderr);
+                        std::fprintf(stderr, "strata decode CPU pool GU expert finish headroom mean/max: %.2f/%.2f ms/window\n",
+                                     (task_timing.gu_expert_mean_headroom_ms - task_timing0.gu_expert_mean_headroom_ms) / w,
+                                     (task_timing.gu_expert_max_headroom_ms - task_timing0.gu_expert_max_headroom_ms) / w);
                     }
-                    std::fputc('\n', stderr);
-                    std::fprintf(stderr, "strata decode CPU pool GU expert finish headroom mean/max: %.2f/%.2f ms/window\n",
-                                 (task_timing.gu_expert_mean_headroom_ms - task_timing0.gu_expert_mean_headroom_ms) / w,
-                                 (task_timing.gu_expert_max_headroom_ms - task_timing0.gu_expert_max_headroom_ms) / w);
                     const auto& nt = drive.d.diagnostic_cpu_nt;
                     std::fprintf(stderr, "strata decode work: %016llx CPU blob bytes %llu groups1..8 %llu %llu %llu %llu %llu %llu %llu %llu; other %llu\n",
                                  (unsigned long long) drive.d.diagnostic_work_hash,

@@ -207,6 +207,12 @@ public:
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
+    /// STRATA_HOST_STAGE_TIMING=1: main window path only; resource samples are Linux-only.
+    struct HostStageTiming {
+        double wall_ms = 0, cpu_ms = 0;
+        uint64_t minor_faults = 0, major_faults = 0, samples = 0, resource_samples = 0;
+    };
+    HostStageTiming host_stage_timing[2]; // input/hash/prefetch preparation, then PLE collection
     int64_t windows = 0;
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
     /// window), as one line; empty when off.

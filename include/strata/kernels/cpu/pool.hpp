@@ -216,7 +216,8 @@ public:
         double task_wall_ms[9] = {}; // indexed by largest input group in the row task
         uint64_t tasks[9] = {};
     };
-    /// Diagnostic only; CPU sampling excludes parked spinning and is unavailable on Windows.
+    /// STRATA_POOL_TASK_TIMING=1 with phase timing: CPU sampling excludes parked spinning.
+    /// Diagnostic only; thread CPU sampling is unavailable on Windows.
     NativeTaskTiming native_task_timing() const { return native_task_timing_; }
 
     /// **A PARKED WORKER SPINS FOR THIS LONG, THEN SLEEPS.**  The park is a `_mm_pause` spin because a layer's

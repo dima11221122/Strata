@@ -50,6 +50,9 @@
 #include <cstring>
 #include <exception>
 #include <immintrin.h>
+#if defined(__linux__)
+#include <sys/resource.h>
+#endif
 
 namespace strata::core {
 namespace {
@@ -57,6 +60,46 @@ namespace {
 constexpr float EPS = 1e-6f;
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+const bool g_host_stage_timing = [] {
+    const char* value = std::getenv("STRATA_HOST_STAGE_TIMING");
+    return value != nullptr && std::atoi(value) != 0;
+}();
+struct HostStageSample {
+    Verifier::HostStageTiming& total;
+    Clock::time_point start{};
+#if defined(__linux__)
+    rusage before{};
+    bool resource_valid = false;
+#endif
+    explicit HostStageSample(Verifier::HostStageTiming& counters) : total(counters) {
+        if (!g_host_stage_timing) return;
+#if defined(__linux__)
+        resource_valid = getrusage(RUSAGE_THREAD, &before) == 0;
+#endif
+        start = Clock::now();
+    }
+    ~HostStageSample() {
+        if (!g_host_stage_timing) return;
+        total.wall_ms += ms_since(start);
+        ++total.samples;
+#if defined(__linux__)
+        rusage after{};
+        if (resource_valid && getrusage(RUSAGE_THREAD, &after) == 0) {
+            const auto cpu_ms = [](const rusage& value) {
+                return 1000.0 * (value.ru_utime.tv_sec + value.ru_stime.tv_sec) +
+                       0.001 * (value.ru_utime.tv_usec + value.ru_stime.tv_usec);
+            };
+            const double cpu_delta = cpu_ms(after) - cpu_ms(before);
+            if (cpu_delta >= 0 && after.ru_minflt >= before.ru_minflt && after.ru_majflt >= before.ru_majflt) {
+                total.cpu_ms += cpu_delta;
+                total.minor_faults += (uint64_t) (after.ru_minflt - before.ru_minflt);
+                total.major_faults += (uint64_t) (after.ru_majflt - before.ru_majflt);
+                ++total.resource_samples;
+            }
+        }
+#endif
+    }
+};
 const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
 #define VDBG(...) do { if (g_dbg) { std::fprintf(stderr, "verify dbg: " __VA_ARGS__); std::fflush(stderr); } } while (0)
 
@@ -1400,22 +1443,25 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (!capture(T, err) || !capture_commit(err)) return false;
     VDBG("captured; staging\n");
     const Clock::time_point t0 = Clock::now();
-    if (!staged_) stage_inputs(T, tokens, pos0);
-    staged_ = false;
     const bool do_ple = ss.ple.ready() && ple_stage();
     uint32_t ple_rows[kVerifyMaxT * PLE_N_HEADS];
-    if (do_ple) {
-        int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
-        for (int t = 0; t < T; ++t) {
-            ngram_rows(&tokens[t], prev, 1, ss.ple.consts, ple_rows + t * PLE_N_HEADS);
-            prev[0] = prev[1];
-            prev[1] = tokens[t];
-            ss.ple.table->prefetch_rows(ple_rows + t * PLE_N_HEADS);
+    {
+        HostStageSample timing(host_stage_timing[0]);
+        if (!staged_) stage_inputs(T, tokens, pos0);
+        staged_ = false;
+        if (do_ple) {
+            int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
+            for (int t = 0; t < T; ++t) {
+                ngram_rows(&tokens[t], prev, 1, ss.ple.consts, ple_rows + t * PLE_N_HEADS);
+                prev[0] = prev[1];
+                prev[1] = tokens[t];
+                ss.ple.table->prefetch_rows(ple_rows + t * PLE_N_HEADS);
+            }
         }
+        if (trace_h_ != nullptr) std::memset(trace_h_, 0, trace_n_ * 8);   // #649: this window's breadcrumbs only
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        trace_ev("WINDOW", -1, -1, pos0 * 16 + T);
     }
-    if (trace_h_ != nullptr) std::memset(trace_h_, 0, trace_n_ * 8);   // #649: this window's breadcrumbs only
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    trace_ev("WINDOW", -1, -1, pos0 * 16 + T);
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
     const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
@@ -1431,6 +1477,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;   // #267 test hook (off: false)
     if (all_resident_ && !test_stall) {
         if (do_ple) {
+            HostStageSample timing(host_stage_timing[1]);
             const Clock::time_point tp = Clock::now();
             if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
             std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -1511,6 +1558,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         // Layer 0's VRAM experts, and before raising *flag = 1), the NVMe PLE reads overlap with both
         // MtpDrafter::draft and Layer 0's attention + router + expert execution!
         if (k == 0 && do_ple) {
+            HostStageSample timing(host_stage_timing[1]);
             const Clock::time_point tp = Clock::now();
             if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
             std::atomic_thread_fence(std::memory_order_seq_cst);

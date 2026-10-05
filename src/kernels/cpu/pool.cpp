@@ -38,6 +38,14 @@ bool native_phase_timing_enabled() {
     return enabled;
 }
 
+bool native_task_timing_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("STRATA_POOL_TASK_TIMING");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return enabled && native_phase_timing_enabled();
+}
+
 double task_thread_cpu_ms() {
 #if !defined(_WIN32) && defined(CLOCK_THREAD_CPUTIME_ID)
     timespec ts{};
@@ -582,7 +590,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
         const uint32_t i = (uint32_t) ci;
         if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);
         else { hstate_.store(ci, std::memory_order_relaxed); hstate_ms_.store(now_ms(), std::memory_order_relaxed); }
-        const bool timed = (mode_ == 5 || mode_ == 6) && native_phase_timing_enabled();
+        const bool timed = (mode_ == 5 || mode_ == 6) && native_task_timing_enabled();
         const auto task_start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const double cpu_start = timed && i % 16 == 0 ? task_thread_cpu_ms() : -1;
         int max_nt = 0;
@@ -699,9 +707,10 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
 
 void ExpertPool::run_phase(int mode, int n_tasks) {
     const bool timed = native_phase_timing_enabled() && (mode == 5 || mode == 6);
+    const bool task_timed = timed && native_task_timing_enabled();
     const auto a = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     wait_parked("before a phase");
-    if (timed) {
+    if (task_timed) {
         native_task_samples_.resize((size_t) n_tasks);
         native_worker_finish_.assign((size_t) n_ + 1, 0);
         if (mode == 5) native_expert_finish_.assign((size_t) (mrows_ / FF), 0);
@@ -720,6 +729,8 @@ void ExpertPool::run_phase(int mode, int n_tasks) {
         // Includes the host's work and waiting for other workers' completion.
         ms_native_drain_ += std::chrono::duration<double, std::milli>(c - b).count();
         ms_native_repark_ += std::chrono::duration<double, std::milli>(d - c).count();
+    }
+    if (task_timed) {
         // Every sample is written before its task's release increment of done_.
         // Late sleepers that cannot claim this epoch never touch the sample array.
         for (size_t i = 0; i < native_task_samples_.size(); ++i) {
