@@ -54,6 +54,16 @@ constexpr int GGML_Q8_0 = 8;
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
+bool accepted_catchup() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_MTP_ACCEPTED_CATCHUP");
+        const bool on = value && std::atoi(value) != 0;
+        if (on) std::fprintf(stderr, "[mtp-catchup] accepted-prefix active=1\n");
+        return on;
+    }();
+    return enabled;
+}
+
 struct Bump {
     uint8_t* base = nullptr;
     uint64_t used = 0;
@@ -734,11 +744,13 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
     copy_i32_from_mapped(pos_, m_pos_, (int64_t) 2 * T * g_->n_head, cs_);
     copy_i32_from_mapped(row_, m_row_, 2, cs_);
     copy_from_mapped(Rin_, window_R_, (int64_t) T * HCN, cs_);
-    // the catch-up: K/V for the window's T cells, then the full layer for row a only (its cell's K/V is written
-    // again, identically), staged by the host in step row 2*max_t - 1; the draft chain is one graph per step
-    // (`capture_step`) so the host can stop it when a draft is unlikely
+    // Default: K/V for all T window cells, then the full layer for row a. The opt-in
+    // receives T=a+1 and catches up only the preceding a cells: the full layer writes
+    // the selected cell itself, and causal attention never reads rejected future cells.
+    // The draft chain is one graph per step so the host can stop unlikely drafts.
     const int ra = 2 * max_t_ - 1;
-    ok = record_forward(T, -1, cs_, err);
+    const int catchup_t = accepted_catchup() ? T - 1 : T;
+    if (catchup_t > 0) ok = record_forward(catchup_t, -1, cs_, err);
     if (ok) mtp_select(Rin_, HCN, tok_, row_, Rin_, tok_, nullptr, 0, cs_);
     if (ok) {
         copy_i32_from_mapped(step_ + ra * 4, m_step_ + ra * 4, 4, cs_);
@@ -888,7 +900,8 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     const bool cp = coupled_active_;   // coupled draft sampling for this request: its own graphs
-    if (!capture_round(T, cp, err)) return false;
+    const int draft_rows = accepted_catchup() ? a + 1 : T;
+    if (!capture_round(draft_rows, cp, err)) return false;
     const int max_steps = std::min(max_t_ - 1, max_drafts_);
     for (int j = 1; j < max_steps; ++j)
         if (!capture_step(j, cp, err)) return false;
@@ -901,7 +914,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         h_step_[row * 4 + 3] = (int32_t) (cell + 1);
         for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = (int32_t) cell;
     };
-    for (int t = 0; t < T; ++t) {
+    for (int t = 0; t < draft_rows; ++t) {
         h_tok_[t] = tokens[t];
         put(t, p + t);
     }
@@ -927,7 +940,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
 
     int n = 0;
     if (min_p <= 0.0f && max_steps > 0) {
-        if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
+        if (cudaGraphLaunch(cp ? round_exec_c_[draft_rows] : round_exec_[draft_rows], cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }
@@ -961,7 +974,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         prefetch_ple(drafts[last]);
         n = max_steps;
     } else if (max_steps > 0) {
-        if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
+        if (cudaGraphLaunch(cp ? round_exec_c_[draft_rows] : round_exec_[draft_rows], cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }

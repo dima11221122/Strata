@@ -332,6 +332,12 @@ The basic bracket completed at 21:40 UTC: controls 68.3/67.5/68.9 and 68.9/67.5/
 
 [SpecDec++](https://arxiv.org/abs/2405.19715) motivates adapting candidate length to acceptance and cost, using a trained acceptance head. Selected primary excerpts describe experiments with Llama-2 and two A100-80G GPUs. This empirical local controller does not implement that head or inherit the paper's guarantees or gains. [SpecMoEOff](https://arxiv.org/abs/2508.21706) likewise motivates tuning speculation for offloading hardware and workload; its reported gains do not predict this server's result.
 
+### Accepted-prefix MTP catch-up candidate
+
+`STRATA_MTP_ACCEPTED_CATCHUP=1` removes work from the MTP's K/V-only catch-up. The default pass processes the whole verified window, then computes the full draft layer for selected row `a`, writing that row's K/V again. The candidate stages the original residual/token prefix through `a`, catches up only the preceding `a` rows, and leaves the selected row's K/V to the existing full draft step. A zero-length preceding prefix skips catch-up. Causal attention excludes rejected future cells, and later draft steps write their cells before reading them.
+
+The original target verifier, draft count/confidence, model precision and cache budget remain in use. The graph cache is indexed by the staged prefix size; both coupled and argmax launches use that index. Different batched projection shapes can change MTP rounding and acceptance, so no answer identity or quality claim is made. Scoped review found no issues in the prefix, zero-prefix, causal/ring, coupled or disabled paths. The engine-only build completed at 21:49 UTC, SHA256 `a96749dd4eeeb5e4ca73ae280fce46a3d7c7d3868b38a7311e1677765a305dfd`. Basic control/candidate/control generation is running; no regression has run for this default-off candidate.
+
 ### Earlier validation
 
 The initial CUDA 13, SM 120 build completed. Of 75 registered CTest cases, 73 passed. `ple_parity` lacked its relative Q2_0 GGUF fixture; `expert_multi_test` requires AVX-512 VNNI/VBMI unavailable on this EPYC. These two failures are reported rather than hidden. The IQ3_S runtime uses the supported AVX2 path.
