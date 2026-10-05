@@ -36,6 +36,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace strata::kernels {
 namespace {
@@ -1072,11 +1073,55 @@ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w
     }
 }
 
+// Experimental Q6_K layout: each warp owns a complete output row, eliminating
+// the cross-warp shared-memory reduction. The quantized dot remains unchanged;
+// accumulating blocks in one warp changes floating-point summation order.
+template<int NCOLS>
+__launch_bounds__(WARPS * WARP, 4)
+__global__ void native_q6_k_rowwarp_kernel(const Q6KBlock* __restrict__ w,
+                                          const Q81Block* __restrict__ x,
+                                          float* __restrict__ y, int n_in, int n_out) {
+    const int lane = int(threadIdx.x);
+    const int row = int(blockIdx.x) * WARPS + int(threadIdx.y);
+    if (row >= n_out) return;
+    const int blocks_per_row = n_in / QK;
+    const int x_stride = n_in / Q8K;
+    float acc[NCOLS] = {};
+    for (int kb = 0; kb < blocks_per_row; ++kb) {
+        const auto weight = Q6KTraits::load(w + std::size_t(row) * blocks_per_row + kb, lane);
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j)
+            acc[j] += Q6KTraits::apply(weight, x + std::size_t(j) * x_stride + kb * 8, lane);
+    }
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+        const float value = warp_sum(acc[j]);
+        if (lane == 0) y[std::size_t(j) * n_out + row] = value;
+    }
+}
+
 template<typename F, int NCOLS>
 void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
     const auto* w = static_cast<const typename F::Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    if (!g_multi_exact) {
+    bool compact_q6 = false;
+    if constexpr (std::is_same_v<F, Q6KTraits>) {
+        static const bool rowwarp = [] {
+            const char* value = std::getenv("STRATA_Q6_ROW_WARP");
+            return value && std::atoi(value) != 0;
+        }();
+        if (rowwarp) {
+            const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+            native_q6_k_rowwarp_kernel<NCOLS><<<blocks, dim3(WARP, WARPS), 0, s>>>(w, x, y, n_in, n_out);
+            return;
+        }
+        static const bool enabled = [] {
+            const char* value = std::getenv("STRATA_Q6_COMPACT_MULTI");
+            return value && std::atoi(value) != 0;
+        }();
+        compact_q6 = enabled;
+    }
+    if (!g_multi_exact || compact_q6) {
         constexpr int NW = NCOLS <= 4 ? 4 : 2;
         const unsigned blocks = unsigned((std::size_t(n_out) + 1) / 2);
         native_mmvq_multi_kernel<F, NCOLS, NW, 2><<<blocks, dim3(WARP, NW), 0, s>>>(w, x, y, n_in, n_out);

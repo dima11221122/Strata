@@ -27,8 +27,11 @@ std::size_t native_q8_1_bytes(int n_in, int ncols = 1);
 
 // Layout for ncols > 1. false: llama.cpp's generic multi-column table (upstream), equal to ncols == 1 to
 // float rounding, speed not yet measured. true (default): the ncols == 1 layout, every column bitwise equal to a
-// single-column call. Set before
-// graph capture; captured graphs keep the kernels they captured.
+// single-column call unless STRATA_Q6_COMPACT_MULTI or STRATA_Q6_ROW_WARP is enabled:
+// these experimental overrides use another reduction layout for Q6_K only.
+// native_mmvq_multi_exact() reports the global setting, not these overrides.
+// Set before graph capture; captured graphs
+// keep the kernels they captured.
 void native_mmvq_set_multi_exact(bool exact);
 bool native_mmvq_multi_exact();
 

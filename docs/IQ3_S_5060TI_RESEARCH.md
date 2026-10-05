@@ -10,6 +10,7 @@ This fork investigates 90 tokens/s for one request using the original Qwen3.8-Fl
 - One request at a time. Three distinct prompts: Python LRU cache, database recovery, TypeScript task queue. Each generates 512 tokens, greedy, reasoning off. Use the median of the engine's decode rates, with each individual rate recorded. Repeat promising candidates and use held-out prompts.
 - Keep authentication, 65,536-token capacity, tool calls, and both model shards. Report separate numbers for reduced context or changed weight quantization; those do not satisfy the original target.
 - Profiles and credentials stay outside the checkout. GPU event profiling changes scheduling, so its rate is diagnostic only.
+- The [sanitized result ledger](IQ3_S_5060TI_RESULTS.json) records valid timestamped runs, exact benchmark prompts, executable hashes, output hashes, draft acceptance, and observed clocks. It omits credentials and generated answers.
 
 ## Results before engine changes
 
@@ -27,6 +28,8 @@ The workload cache was reverted. The calibrated CPU pool uses 22 workers; reduci
 2. [SpecMoEOff](https://arxiv.org/abs/2508.21706): reuse weights across speculative tokens and choose speculation length using measured draft acceptance and execution costs. Its throughput experiments also use large request batches, which are outside this target. Applicable here: tune single-request window depth and CPU/GPU balance together; retain target-model verification. Its CPU attention strategy is less compelling for this Qwen model at short context, where attention is a small measured stage.
 3. [MoE-SpeQ](https://arxiv.org/abs/2511.14102): lookahead-aware expert scheduling and a governor trade additional speculative work against memory and transfer costs. Its draft is a quantized full MoE model. Strata's MTP is one MoE draft block and does not produce expert routes for the target's 48 layers. Replacing it with a second full MoE draft would add substantial memory and complexity. Applicable here: measure the draft precision, acceptance, and VRAM tradeoff while retaining target verification. The paper's A100 40 GB and PCIe x16 results are not predictions for this server.
 4. [PowerInfer](https://arxiv.org/abs/2312.12456): exploit hot activation locality and heterogeneous placement. Its sparse-neuron predictor is model-specific; it cannot simply be applied to this MoE checkpoint. Applicable here: measure expert popularity and per-layer cost, and test placement under the actual VRAM budget.
+5. [T-MAC](https://arxiv.org/abs/2407.00088): arrange low-bit operands for register lookup instructions and control lookup-table storage. Its bit-plane product algorithm is not a direct replacement for these IQ codebooks. Applicable idea: retain exact codebook coefficients but encode each signed coefficient as a nibble, then use AVX2 byte shuffles instead of scattered scalar table loads.
+6. [LUT-GEMM](https://arxiv.org/abs/2206.09557) and [FLUTE](https://arxiv.org/abs/2407.10960): reduce dequantization work and restructure lookup-quantized weights. Their GPU formats and arithmetic differ from Strata's native blocks. The CPU trial below takes the layout idea without changing checkpoint precision; the earlier CUDA shared-codebook trial was slower here.
 
 ## Experimental sequence
 
@@ -35,9 +38,9 @@ The workload cache was reverted. The calibrated CPU pool uses 22 workers; reduci
 - [x] Enable CPU/GPU decode stage timings and record wait, pool, draft and dense-kernel costs.
 - [ ] Compare speculative window depths 2, 4, 6, 8 and confidence floors, without changing target verification.
 - [ ] Compare INT8 and Q4 KV, and 32K versus 20K resident KV while keeping 64K total capacity. Check long-context retrieval before retaining lower precision.
-- [ ] Compare transfer modes and CPU codebook gather/prefetch settings. Each run changes one factor from baseline.
-- [ ] Test measured-cost expert placement against routing-order placement with a pure scheduler test and native expert parity checks.
-- [ ] Profile and optimize a dominant CUDA kernel; use exact arithmetic order where possible, microbenchmarks, then complete decode benchmarks.
+- [x] Compare transfer modes and CPU codebook gather/prefetch settings. Each run changes one factor from baseline.
+- [x] Test expert input-reuse placement against routing-order placement with a pure scheduler test and native expert parity checks.
+- [x] Profile a dominant CUDA kernel, test an opt-in projection implementation with independent numerical checks and microbenchmarks, then measure complete decode.
 - [ ] Repeat the best configuration, run held-out prompts, long-context retrieval, and real Pi tool execution. Publish every result, including regressions.
 
 ## Initial profiling
@@ -67,6 +70,84 @@ All new engine paths are opt-in. The calibrated default keeps the original arith
 
 These are separate completions, not identical token replays. Greedy output can change with expert placement and group arithmetic, as upstream's `STRATA_IQ_MT_MIN` documentation explains. Repeat controls and held-out checks are required before a final deployment. No speedup percentage is inferred from one unusually slow control.
 
+### Further comparisons
+
+The next sweep used the rebuilt executable with SHA-256 `5752617309eb869a45ad4e32cce3d3f84557d689a6aec8f1021faed91df00ef4`. It completed at 09:40 UTC on 2026-10-05.
+
+| Candidate | Decode rates, tokens/s | Median |
+|---|---|---|
+| Control, sweep start | 63.4, 56.0, 67.2 | 63.4 |
+| Requested clock locks, reuse selection | 55.7, 54.2, 66.3 | 55.7 |
+| Requested clock locks, PCIe fraction 0 | 55.8, 58.1, 70.6 | 58.1 |
+| Control after clock reset | 64.9, 60.8, 74.2 | 64.9 |
+| Q5_0 draft experts | 47.9, 44.9, 61.6 | 47.9 |
+| Q5_0 draft experts, speculation 6 | 58.0, 58.3, 69.1 | 58.3 |
+| Reuse selection, PCIe fraction 0.10 | 53.4, 64.1, 74.3 | 64.1 |
+| Reuse selection, PCIe fraction 0.35 | 51.9, 50.0, 60.3 | 51.9 |
+| GPU codebook staging disabled | 62.4, 57.7, 72.3 | 62.4 |
+| Draft probability floor 0.85 | 64.3, 60.8, 74.2 | 64.3 |
+| Control, sweep end | 49.4, 52.6, 71.9 | 52.6 |
+
+The higher floor increased draft acceptance to 89.1%, but did not improve throughput. Q5 acceptance was 80.7% at depth 4 and 74.3% at depth 6. Its extra memory reduced the target expert cache to about 4099 entries. Neither Q5 draft experiment improved the best median.
+
+Clock commands requested 3090 MHz graphics and 14001 MHz memory after model readiness, but the recorded loaded clocks were 2730/13801 MHz. These numbers therefore describe the observed driver behavior, not a verified run at the requested maximum clocks. Power limits stayed at the stock 180 W, and locks were reset after every experiment and on sweep exit. Earlier clock experiments applied locks before service restart and were invalidated.
+
+### AVX2 single-input experiment
+
+A CPU-only probe used 16 real IQ3_S expert gate/up pairs with Q8_K inputs. A fused gate/up loop preserved all tested output bits but was 11–15% slower for two to four inputs, so it was rejected. Disabling loop unrolling did not produce a useful gain either.
+
+On the measured Zen 2 host, the existing single-input IQ256 specialization took about 1350 microseconds per expert, versus about 660 microseconds for GGML. Calling the existing two-input specialization with the same input twice took about 550 microseconds and reproduced the single-input IQ256 output bits. This microbenchmark uses one CPU thread and does not predict a model speedup.
+
+`STRATA_IQ256_PAIR_SINGLE=1` tests that scheduling for single-input IQ3_S gate/up groups on the active AVX2 path. It discards the second output, uses bounded scratch through row 640, and retains the previous specialization for larger row ranges. Other group sizes and formats stay on their existing paths. The default remains disabled. Enabling it switches single-input gate/up from GGML to the existing multi-token reduction order, so final answer quality must be checked.
+
+| Candidate | Decode rates, tokens/s | Median |
+|---|---|---|
+| Control, sweep start | 55.1, 59.7, 75.4 | 59.7 |
+| Paired single-input IQ3_S | 65.6, 59.7, 76.3 | 65.6 |
+| Reuse selection, repeat | 61.1, 57.1, 73.6 | 61.1 |
+| Paired single input with reuse selection | 63.0, 61.1, 73.1 | 63.0 |
+| Control, sweep end | 63.4, 52.0, 63.1 | 63.1 |
+
+This sweep used executable SHA-256 `912558effb2c2848ad805e6eedf8fa59090f31f9acd824dde828a2e60071f223`. Baseline variability remains substantial. These results do not establish the 90 tokens/s target or a stable speedup percentage.
+
+### Lossless CPU lookup-code trial
+
+A throwaway probe read 16 real gate/up expert pairs for each native GU format in the IQ3_S checkpoint: IQ3_XXS (18), IQ3_S (21), and IQ2_S (22). Each 256-value block keeps the original FP16 scale, its exact sub-scales, and 128 bytes of nibble codes. The 16-entry signed lookup alphabet contains the original integer coefficients. The derived block is 146 bytes, larger than the original 98/110/82 bytes, and is never sent to the GPU.
+
+Seven alternating timing rounds on one pinned CPU core gave these median kernel speedups over the actual default dispatch (GGML at NT1, IQ256 at NT2–4):
+
+| GU format | NT1 | NT2 | NT3 | NT4 |
+|---|---:|---:|---:|---:|
+| IQ3_XXS | 2.15× | 1.86× | 1.64× | 1.57× |
+| IQ3_S | 3.24× | 2.46× | 2.29× | 2.14× |
+| IQ2_S | 1.24× | 1.57× | 1.51× | 1.36× |
+
+All sampled outputs matched the existing IQ256 kernel bit for bit. Single-input GGML uses another floating-point reduction order; the maximum observed relative difference was 2.96e-4, including near-zero outputs. This is not an answer-quality result or an end-to-end speedup.
+
+`STRATA_IQ_PACKED_CACHE_GB=6` enables an experimental bounded LRU cache of those derived GU rows on non-AVX512 AVX2 CPUs. Entries use source/layer/expert identity, with the active batch retained until all row tasks finish. Workers pack a missing row range before computing it. Original blobs, GPU copies and down weights remain unchanged. The default is disabled. Regression is deferred until a repeatable complete-decode improvement, as requested.
+
+| Cache implementation | Capacity | Decode rates, tokens/s | Median |
+|---|---:|---|---:|
+| Scalar packing, value-initialized new buffers | 6 GiB | 33.7, 30.6, 33.3 | 33.3 |
+| Scalar packing, value-initialized new buffers | 12 GiB | 31.9, 38.8, 46.6 | 38.8 |
+| SIMD packing, value-initialized new buffers | 6 GiB | 42.8, 42.4, 48.5 | 42.8 |
+| SIMD packing, value-initialized new buffers | 12 GiB | 37.2, 50.5, 57.6 | 50.5 |
+| SIMD packing, recycled uninitialized buffers | 12 GiB | 52.2, 64.1, 71.5 | 64.1 |
+| Recycled buffers, native GU type21 only | 12 GiB | 61.8, 58.9, 75.7 | 61.8 |
+| Recycled buffers, native GU types18+21 | 12 GiB | 52.6, 60.6, 73.0 | 60.6 |
+
+The baseline medians in the initial sweeps were 63.8 and60.3. Buffer recycling removed host zeroing and reused physical pages; its64.1 median still fell below the66.2/65.1 controls. Restricting the cache to selected native GU formats also failed to improve complete generation. The optimization remains disabled and work on it is stopped. Increased hit traffic (146-byte derived blocks versus82–110 original bytes) and approximately23% misses are plausible costs, not a proven wall-time attribution. The161.4ms preparation counter excludes packing inside worker tasks. A read-only review found no defect in buffer lifetime or complete row initialization. Incomplete follow-up combinations were stopped and do not count as measured medians.
+
+### Verifier critical-path trials
+
+The stock `--spec4` configuration automatically uses verification width6 and MTP cap4 when suffix drafting is enabled. Explicit width8/MTP4 measured61.4 tokens/s; legacy `--spec6` (width8/MTP6) measured52.2. Zero PCIe expert offloading measured63.4. Controls bracketing that sweep measured60.1 and65.5. No setting was retained and regression remains deferred.
+
+Two default-off probes target the existing verifier path. `STRATA_Q6_COMPACT_MULTI=1` chooses the existing two-row multi-column layout only for Q6_K projections, preserving checkpoint bytes and activation quantization while changing floating-point reduction order. It measured55.5 tokens/s. `STRATA_FETCH_128=1` changes mapped-fetch launch size from384 to128 CTAs; its grid-stride loop still copies the same bytes. It measured60.0. The controls were59.5 and65.2. Neither option was retained.
+
+`STRATA_Q6_ROW_WARP=1` is a default-off option retained on this server after measurement and focused regression. Each warp owns a complete output row and uses the existing Q6_K/Q8_1 dot; this eliminates the cross-warp shared-memory reduction. Weight bytes, quantized activations and single-column calls remain unchanged. Floating-point accumulation order changes. Medians68.5,68.2 and67.0 repeated against controls65.1,63.9 and63.6. All candidate runs produced the same output hashes and aggregate draft acceptance81.5%; candidate answers can differ from the controls. This is a measured gain against these controls, not90 tokens/s. It takes priority over the compact flag when both are enabled.
+
+After the gain repeated, the existing MMVQ contract check and both96-case numerical suites passed. The new suites compare independent scalar Q6_K dequantization and FP64 dots over the same Q8_1 bytes, with widths256/512/2560/8192, ragged row tails, inactive-output sentinels and captured launches. Worst relative L2 errors were2.164e-7 for the default and2.169e-7 for rowwarp (limit3e-6). Three generated Python functions passed their assertions, and retrieval returned the exact code from a20,534-token prompt. Missing/invalid/correct credentials returned401/401/200. Both remote and local Pi completed a real bash printf tool call and final response. Context capacity remains65,536; the retrieval check did not fill that entire capacity.
+
 ### Placement
 
 `STRATA_PCIE_REUSE=1` selects the missed, pinned experts serving the most input rows, subject to the same transfer quota and staging limit. Ties retain the old last-in-routing-order choice. Resident and peer-GPU experts are excluded. This transfers the same expert blob once for multiple inputs and leaves CPU/GPU result merging unchanged.
@@ -91,4 +172,10 @@ The initial CUDA 13, SM 120 build completed. Of 75 registered CTest cases, 73 pa
 
 Targeted checks cover five PCIe-selection fixtures, manifest rejection, native grouped experts, native Q8_0 expert parity, and 70 graph-captured projection cases per arithmetic mode. Projection outputs are compared with an independent double-precision CPU reference, with BF16 rounding only for eligible cases, relative L2 error at most 3e-6, finite outputs, and untouched stride padding. Literal Python fixtures check runtime role boundaries and the Q5_0 scale, high-bit plane, low-nibble plane, zero blocks, and complete rows.
 
-The CUDA dispatch also checks the current device and the loaded kernel's PTX target. A compute-75 PTX image running on SM120 failed 20 of70 cases before this guard, then passed all70 by falling back to FP32. That regression is registered as `bf16_decode_tc_ptx75_fallback`. Mixed-device switching is covered by the dispatch logic but has not been tested on multiple physical GPUs here. The existing Q5_0/Q8_0 and Q4_K/Q5_0 expert parity checks exercise Q5 in each role separately; they do not establish combined Q5_0/Q5_0 draft numerical parity.
+The CUDA dispatch also checks the current device and the loaded kernel's PTX target. A compute-75 PTX image running on SM120 failed 20 of 70 cases before this guard, then passed all 70 by falling back to FP32. That regression is registered as `bf16_decode_tc_ptx75_fallback`. Mixed-device switching is covered by the dispatch logic but has not been tested on multiple physical GPUs here. The existing Q5_0/Q8_0 and Q4_K/Q5_0 expert parity checks exercise Q5 in each role separately; they do not establish combined Q5_0/Q5_0 draft numerical parity.
+
+After the portability fixes, a fresh incremental build and all nine targeted CTest cases passed. All 15 Python MTP tests passed. This does not replace the full-suite limitations reported above.
+
+The AVX2 trial adds two 48-case CPU tests. The enabled test failed 12 single-input cases before implementation; both tests passed afterward, along with the nine earlier targeted checks. They cover the existing GGML default, the existing IQ256 reduction when enabled, partial row writes, inactive output buffers, finite values, input widths 512/2560, and row counts 640/768. Both tests explicitly clear the inherited `STRATA_NO_IQ256` switch; they also passed with that switch set in the parent environment.
+
+Trial builds compile only the engine and use short generation/throughput checks. Regression followed the repeatable rowwarp improvement, as requested; its focused results are above. The earlier test results do not validate the newer expanded cache, CPU fusion or shared GPU codebook. Those failed options remain disabled. A fresh full-suite pass and physical HIP validation are not claimed. This branch records a validated small gain and failed experiments, not a completed90 tokens/s optimization.

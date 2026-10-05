@@ -2220,6 +2220,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 jo = (int16_t) njobs++;
                 ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
                 nj.blob = b;
+                nj.cache_source = native ? d.src : nullptr;
+                nj.cache_key = (uint64_t) d.layers * (uint64_t) d.n_expert + (uint64_t) e;
                 nj.nt = 0;
             }
             ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];

@@ -11,6 +11,12 @@
 namespace strata::kernels::cpu {
 
 bool iq256_supported(int ggml_type) noexcept;
+/// Lossless CPU lookup-code representation for GU types 18, 21 and 22. Call only after cpu_avx2_ok().
+inline constexpr size_t kIqPackedBlockBytes = 146;
+void iq256_pack_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, int ff,
+                        uint8_t* packed, int r0, int r1);
+void iq256_packed_gu_rows(int type, const uint8_t* packed, int n, int ff, const void* const* act, int nt,
+                          float* const* out, int r0, int r1);
 /// ff[t][r] = silu(gate_r . a[t]) * (up_r . a[t]), rows [r0, r1); gate rows at blob, up rows at blob + up_off.
 void iq256_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
                    int nt, float* const* ff, int r0, int r1);

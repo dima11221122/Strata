@@ -37,7 +37,9 @@
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
+#include <list>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace strata::kernels::cpu {
@@ -56,6 +58,8 @@ struct ExpertJob {
 /// is bitwise the single-token job's.
 struct ExpertJobMulti {
     const uint8_t* blob = nullptr;
+    const void* cache_source = nullptr;  ///< immutable model source; nullptr disables derived GU caching
+    uint64_t cache_key = 0;              ///< layer * number_of_experts + expert
     int nt = 0;
     const ActQ* act[MAXT] = {};
     float* out[MAXT] = {};
@@ -204,6 +208,22 @@ public:
     static constexpr std::chrono::seconds kStall{60};
 
 private:
+    bool fused_hq_ = false;  ///< opt-in IQ4_NL activation quantization in the gate/up tasks
+    struct PackedGuEntry {
+        std::unique_ptr<uint8_t[]> data;
+        std::list<uint64_t>::iterator lru;
+        uint64_t epoch = 0;
+        int type = -1;
+    };
+    void prepare_packed_jobs(const NativeFmt& f, int n);
+    std::unordered_map<uint64_t, PackedGuEntry> packed_cache_;
+    std::list<uint64_t> packed_lru_;
+    const void* packed_source_ = nullptr;
+    size_t packed_bytes_ = 0, packed_limit_ = 0;
+    uint64_t packed_epoch_ = 0, packed_hits_ = 0, packed_misses_ = 0, packed_report_ = 0;
+    double packed_prepare_ms_ = 0;
+    uint8_t* packed_job_[kMaxSplitMulti] = {};
+    bool pack_job_[kMaxSplitMulti] = {};
     void worker(int id);
     void drain(int id, ExpertScratch& scratch, uint32_t epoch);
     void run_phase(int mode, int n_tasks);

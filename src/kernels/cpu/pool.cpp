@@ -2,6 +2,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/iq_avx2.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -561,7 +562,10 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
         } else if (mode_ >= 5) {
             // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows
             const int per = mode_ == 5 ? FF : H;
-            const int64_t g0 = mrows_ * (int64_t) i / mtasks_, g1 = mrows_ * (int64_t) (i + 1) / mtasks_;
+            const int align = fused_hq_ && mode_ == 5 ? 32 : 1;
+            const int64_t units = mrows_ / align;
+            const int64_t g0 = (units * (int64_t) i / mtasks_) * align;
+            const int64_t g1 = (units * (int64_t) (i + 1) / mtasks_) * align;
             for (int64_t r = g0; r < g1;) {
                 const int e = (int) (r / per), r0 = (int) (r % per);
                 const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
@@ -581,7 +585,16 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 } else if (mode_ == 5) {
                     float* ff[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
-                    native_gu_rows(*nfmt_, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+#if defined(STRATA_NATIVE_EXPERTS)
+                    if (packed_job_[e] != nullptr) {
+                        if (pack_job_[e])
+                            iq256_pack_gu_rows(nfmt_->gu_type, mjobs_[e].blob, nfmt_->gu_row, nfmt_->up_off,
+                                               (int) nfmt_->n_embd, FF, packed_job_[e], r0, r1);
+                        iq256_packed_gu_rows(nfmt_->gu_type, packed_job_[e], (int) nfmt_->n_embd, FF,
+                                             mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+                    } else
+#endif
+                        native_gu_rows(*nfmt_, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
                 } else if (q2_native_kernels(nfmt_->d_type)) {
                     // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
                     const ActQ* a2[MAXT];
@@ -593,6 +606,9 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                     for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
                     native_down_rows(*nfmt_, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
                 }
+                if (mode_ == 5 && fused_hq_)
+                    for (int t = 0; t < mjobs_[e].nt; ++t)
+                        native_quant_h_rows(*nfmt_, sb.ff[t], sb.hq[t], r0, r1);
                 r += r1 - r0;
             }
         } else {
@@ -686,24 +702,111 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
+void ExpertPool::prepare_packed_jobs(const NativeFmt& f, int n) {
+    std::fill(packed_job_, packed_job_ + n, nullptr);
+    std::fill(pack_job_, pack_job_ + n, false);
+#if defined(STRATA_NATIVE_EXPERTS)
+    static const size_t limit = [] {
+        const char* v = std::getenv("STRATA_IQ_PACKED_CACHE_GB");
+        const long gb = v ? std::strtol(v, nullptr, 10) : 0;
+        return gb > 0 && gb <= 16 && cpu_avx2_ok() && !cpu_avx512_ok() &&
+               std::getenv("STRATA_NO_IQ256") == nullptr ? (size_t) gb * 1024 * 1024 * 1024 : size_t(0);
+    }();
+    static const uint32_t types = [] {
+        const char* v = std::getenv("STRATA_IQ_PACKED_CACHE_TYPES");
+        if (v == nullptr) return (uint32_t) ((1u << 18) | (1u << 21) | (1u << 22));
+        uint32_t mask = 0;
+        while (*v != '\0') {
+            char* end = nullptr;
+            const long type = std::strtol(v, &end, 10);
+            if (end == v || (type != 18 && type != 21 && type != 22) || (*end != '\0' && *end != ',')) return uint32_t(0);
+            mask |= 1u << type;
+            v = *end == ',' ? end + 1 : end;
+        }
+        return mask;
+    }();
+    if (limit == 0 || (f.gu_type != 18 && f.gu_type != 21 && f.gu_type != 22) ||
+        (types & (1u << f.gu_type)) == 0 ||
+        f.n_embd != H || f.n_ff != FF || H % 256 != 0 || mjobs_[0].cache_source == nullptr) return;
+    wait_parked("before packing cache admission");
+    const auto prep_start = std::chrono::steady_clock::now();
+    if (packed_limit_ == 0) {
+        packed_limit_ = limit;
+        std::fprintf(stderr, "strata: lossless CPU GU cache: %zu MiB (AVX2)\n", limit / (1024 * 1024));
+    }
+    if (packed_source_ != mjobs_[0].cache_source) {
+        packed_cache_.clear(); packed_lru_.clear(); packed_bytes_ = 0;
+        packed_source_ = mjobs_[0].cache_source;
+    }
+    const uint64_t epoch = ++packed_epoch_;
+    const size_t bytes = (size_t) (H / 256) * kIqPackedBlockBytes * FF * 2;
+    for (int e = 0; e < n; ++e) {
+        const auto& job = mjobs_[e];
+        if (job.cache_source != packed_source_) continue;
+        auto it = packed_cache_.find(job.cache_key);
+        if (it != packed_cache_.end() && it->second.type != f.gu_type) continue;
+        if (it == packed_cache_.end()) {
+            PackedGuEntry entry;
+            while (packed_bytes_ + bytes > limit && !packed_lru_.empty()) {
+                const auto victim = packed_cache_.find(packed_lru_.back());
+                if (victim->second.epoch == epoch) break;  // entries in this batch stay alive through both phases
+                // Geometry is fixed at H/FF, so all packed entries have the same size. Keep pages for the next fill.
+                if (entry.data == nullptr) entry.data = std::move(victim->second.data);
+                packed_bytes_ -= bytes;
+                packed_cache_.erase(victim); packed_lru_.pop_back();
+            }
+            if (packed_bytes_ + bytes > limit) continue;
+            packed_lru_.push_front(job.cache_key);
+            // No value initialization: the disjoint worker row tasks write every byte before reading it.
+            if (entry.data == nullptr) entry.data.reset(new uint8_t[bytes]);
+            entry.lru = packed_lru_.begin();
+            entry.type = f.gu_type;
+            it = packed_cache_.emplace(job.cache_key, std::move(entry)).first;
+            packed_bytes_ += bytes;
+            pack_job_[e] = true;
+            ++packed_misses_;
+        } else {
+            packed_lru_.splice(packed_lru_.begin(), packed_lru_, it->second.lru);
+            ++packed_hits_;
+        }
+        it->second.epoch = epoch;
+        packed_job_[e] = it->second.data.get();
+    }
+    packed_prepare_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - prep_start).count();
+    const uint64_t report = (packed_hits_ + packed_misses_) / 16384;
+    if (report > packed_report_) {
+        packed_report_ = report;
+        std::fprintf(stderr, "strata: CPU GU cache: %llu hits, %llu fills, %zu MiB, %.1f ms preparation\n",
+                     (unsigned long long) packed_hits_, (unsigned long long) packed_misses_,
+                     packed_bytes_ / (1024 * 1024), packed_prepare_ms_);
+    }
+#else
+    (void) f;
+#endif
+}
+
 void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
     if (n <= 0) return;
+    static const bool fuse = [] { const char* v = std::getenv("STRATA_POOL_FUSED_HQ"); return v != nullptr && std::atoi(v) != 0; }();
+    fused_hq_ = fuse && f.d_type == 20 && FF % 32 == 0;
     const auto t0 = std::chrono::steady_clock::now();
     // more distinct experts than buffers: run them in batches
     for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {
         const int nb = (std::min)(kMaxSplitMulti, n - b0);
         mjobs_ = jobs + b0;
         nfmt_ = &f;
+        prepare_packed_jobs(f, nb);
         const int threads = n_ + (host_works_ ? 1 : 0);
-        mtasks_ = 3 * threads;
+        mtasks_ = fused_hq_ ? (std::min)(3 * threads, nb * FF / 32) : 3 * threads;
         mrows_ = (int64_t) nb * FF;
         const auto a = std::chrono::steady_clock::now();
         run_phase(5, mtasks_);
         const auto b = std::chrono::steady_clock::now();
-        for (int e = 0; e < nb; ++e)
-            for (int t = 0; t < mjobs_[e].nt; ++t)
-                if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
-                else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
+        if (!fused_hq_)
+            for (int e = 0; e < nb; ++e)
+                for (int t = 0; t < mjobs_[e].nt; ++t)
+                    if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
+                    else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
         const auto c = std::chrono::steady_clock::now();
         mrows_ = (int64_t) nb * H;
         run_phase(6, mtasks_);

@@ -18,6 +18,8 @@
 
 #include <immintrin.h>
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -110,6 +112,9 @@ inline void rows_ahead(const uint8_t* p) {
 // scalar loads assembled with set_epi32.  AVX2 gather is a different instruction with worse throughput on some cores
 // (opt-in, as on AVX-512); on the i7-12850HX it measures ~1.3x on the two 32-bit-grid formats, bit-exact.
 static const bool gather = [] { const char* v = std::getenv("STRATA_IQ256_GATHER"); return v != nullptr && std::atoi(v) != 0; }();
+// Opt-in for AVX2 single-input IQ3_S groups. GCC's paired specialization schedules the
+// same reduction faster on the measured Zen 2 host; the second output is discarded.
+static const bool pair_single = [] { const char* v = std::getenv("STRATA_IQ256_PAIR_SINGLE"); return v != nullptr && std::atoi(v) != 0; }();
 
 // ---- per format: one 32-value half (values 64*j + 32*half .. +31) -> grid magnitudes, sign vector, scales
 template <int TY> struct Fmt32;
@@ -405,7 +410,112 @@ void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* 
     }
 }
 
+// Original codebook coefficients, kept exactly. The unused IQ2_S codes are never produced.
+template <int TY> struct PackedValues;
+template <> struct PackedValues<18> {
+    static constexpr std::array<int8_t, 16> v = {4,12,20,28,36,44,52,62,-4,-12,-20,-28,-36,-44,-52,-62};
+};
+template <> struct PackedValues<21> {
+    static constexpr std::array<int8_t, 16> v = {1,3,5,7,9,11,13,15,-1,-3,-5,-7,-9,-11,-13,-15};
+};
+template <> struct PackedValues<22> {
+    static constexpr std::array<int8_t, 16> v = {8,25,43,0,0,0,0,0,-8,-25,-43,0,0,0,0,0};
+};
+template <int TY>
+void pack_gu(const uint8_t* blob, size_t rb, size_t up, int n, int ff, uint8_t* packed, int r0, int r1) {
+    // Each original magnitude alphabet maps exactly to 0..7 by this shift, including IQ3_XXS's 62.
+    constexpr int shift = TY == 21 ? 1 : TY == 18 ? 3 : 4;
+    const int nb = n / 256;
+    const size_t prb = (size_t) nb * kIqPackedBlockBytes;
+    for (int role = 0; role < 2; ++role) for (int r = r0; r < r1; ++r) for (int i = 0; i < nb; ++i) {
+        const uint8_t* b = blob + (role ? up : 0) + (size_t) r * rb + (size_t) i * Fmt32<TY>::bytes;
+        uint8_t* p = packed + ((size_t) role * ff + r) * prb + (size_t) i * kIqPackedBlockBytes;
+        std::memcpy(p, b, 2);
+        for (int h = 0; h < 8; ++h) {
+            __m256i g, s, sc;
+            Fmt32<TY>::decode(b, h / 2, h % 2, g, s, sc);
+            p[2 + 2 * h] = (uint8_t) _mm256_extract_epi16(sc, 0);
+            p[3 + 2 * h] = (uint8_t) _mm256_extract_epi16(sc, 8);
+            const __m256i idx = _mm256_and_si256(_mm256_srli_epi16(g, shift), _mm256_set1_epi8(7));
+            const __m256i codes = _mm256_or_si256(idx, _mm256_and_si256(s, _mm256_set1_epi8(8)));
+            const __m128i bits = _mm_or_si128(_mm256_castsi256_si128(codes),
+                                             _mm_slli_epi16(_mm256_extracti128_si256(codes, 1), 4));
+            _mm_storeu_si128((__m128i*) (p + 18 + 16 * h), bits);
+        }
+    }
+}
+template <int TY, int NT>
+inline void packed_dot(const uint8_t* row, int nb, const block_q8_K* const* y, float* result) {
+    const __m128i lut = _mm_loadu_si128((const __m128i*) PackedValues<TY>::v.data());
+    const __m128i mask = _mm_set1_epi8(15);
+    __m256 accf[NT];
+    for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const uint8_t* b = row + (size_t) i * kIqPackedBlockBytes;
+        rows_ahead(b + prefetch_ahead);
+        __m256i acci[NT];
+        for (int t = 0; t < NT; ++t) acci[t] = _mm256_setzero_si256();
+        for (int h = 0; h < 8; ++h) {
+            const __m128i bits = _mm_loadu_si128((const __m128i*) (b + 18 + 16 * h));
+            const __m256i q = _mm256_inserti128_si256(
+                _mm256_castsi128_si256(_mm_shuffle_epi8(lut, _mm_and_si128(bits, mask))),
+                _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(bits, 4), mask)), 1);
+            const __m256i g = _mm256_sign_epi8(q, q);
+            const __m256i s = _mm256_sign_epi8(_mm256_set1_epi8(1), q);
+            const __m256i sc = TY == 22 ? sc16(b[2 + 2 * h], b[3 + 2 * h]) : sc32(b[2 + 2 * h]);
+            for (int t = 0; t < NT; ++t) {
+                const __m256i a = _mm256_loadu_si256((const __m256i*) (y[t][i].qs + 32 * h));
+                acci[t] = _mm256_add_epi32(acci[t], _mm256_madd_epi16(_mm256_maddubs_epi16(g, _mm256_sign_epi8(a, s)), sc));
+            }
+        }
+        const float dx = h2f(u16(b)) * Fmt32<TY>::K;
+        for (int t = 0; t < NT; ++t)
+            accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y[t][i].d), _mm256_cvtepi32_ps(acci[t]), accf[t]);
+    }
+    for (int t = 0; t < NT; ++t) result[t] = hsum8(accf[t]);
+}
+template <int TY, int NT>
+void packed_gu(const uint8_t* blob, int n, int ff, const void* const* act, float* const* out, int r0, int r1) {
+    const block_q8_K* y[NT];
+    for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
+    const size_t rb = (size_t) (n / 256) * kIqPackedBlockBytes, up = rb * ff;
+    for (int r = r0; r < r1; ++r) {
+        float g[NT], u[NT];
+        packed_dot<TY, NT>(blob + (size_t) r * rb, n / 256, y, g);
+        packed_dot<TY, NT>(blob + up + (size_t) r * rb, n / 256, y, u);
+        for (int t = 0; t < NT; ++t) out[t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
+    }
+}
+template <int TY>
+void packed_gu_nt(const uint8_t* blob, int n, int ff, const void* const* act, int nt, float* const* out, int r0, int r1) {
+    switch (nt) {
+        case 1: packed_gu<TY, 1>(blob, n, ff, act, out, r0, r1); break;
+        case 2: packed_gu<TY, 2>(blob, n, ff, act, out, r0, r1); break;
+        case 3: packed_gu<TY, 3>(blob, n, ff, act, out, r0, r1); break;
+        case 4: packed_gu<TY, 4>(blob, n, ff, act, out, r0, r1); break;
+        default: for (int t = 0; t < nt; t += 4)
+            packed_gu_nt<TY>(blob, n, ff, act + t, std::min(4, nt - t), out + t, r0, r1);
+    }
+}
+
 }  // namespace
+
+void iq256_pack_gu_rows(int type, const uint8_t* blob, size_t rb, size_t up, int n, int ff,
+                        uint8_t* packed, int r0, int r1) {
+    switch (type) {
+        case 18: pack_gu<18>(blob, rb, up, n, ff, packed, r0, r1); break;
+        case 21: pack_gu<21>(blob, rb, up, n, ff, packed, r0, r1); break;
+        case 22: pack_gu<22>(blob, rb, up, n, ff, packed, r0, r1); break;
+    }
+}
+void iq256_packed_gu_rows(int type, const uint8_t* blob, int n, int ff, const void* const* act, int nt,
+                          float* const* out, int r0, int r1) {
+    switch (type) {
+        case 18: packed_gu_nt<18>(blob, n, ff, act, nt, out, r0, r1); break;
+        case 21: packed_gu_nt<21>(blob, n, ff, act, nt, out, r0, r1); break;
+        case 22: packed_gu_nt<22>(blob, n, ff, act, nt, out, r0, r1); break;
+    }
+}
 
 bool iq256_supported(int type) noexcept {
     return type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 23;
@@ -417,7 +527,14 @@ void iq256_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, 
         case 16: gu_rows_nt<16>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         case 17: gu_rows_nt<17>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         case 18: gu_rows_nt<18>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 21: gu_rows_nt<21>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 21:
+            if (pair_single && nt == 1 && r1 <= 640) {
+                float unused[640];
+                const void* inputs[2] = {act[0], act[0]};
+                float* outputs[2] = {ff[0], unused};
+                gu_rows<21, 2>(blob, gu_row, up_off, n, inputs, outputs, r0, r1);
+            } else gu_rows_nt<21>(nt, blob, gu_row, up_off, n, act, ff, r0, r1);
+            break;
         case 22: gu_rows_nt<22>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         case 23: gu_rows_nt<23>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         default: break;
