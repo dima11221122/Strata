@@ -2655,7 +2655,22 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
     const auto* X = (const block_q8_1*) x_q8_1;
     const bool v1 = g_grouped_v1;
-    const int64_t gy = (v1 || grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
+    int64_t gy = (v1 || grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+    static const bool resident_grid8 = env_on("STRATA_RESIDENT_GROUP_GRID8");
+    if (resident_grid8 && !v1 && !g_old_kernels && grid_groups <= 0 &&
+        L.n_embd == 2560 && L.n_ff == 640 && gy > 8) {
+        // Resident launches otherwise reserve a CTA row for every possible
+        // group. Reuse the existing group stride without changing row dots,
+        // column batches, scratch ownership or the smaller PCIe launches.
+        gy = 8;
+        static const bool logged = [cap_groups] {
+            std::fprintf(stderr, "[resident-group-grid] rows=8 cap=%lld active=1\n", (long long) cap_groups);
+            return true;
+        }();
+        (void) logged;
+    }
+#endif
     const dim3 ggu((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) gy);
 #if defined(STRATA_HIP_GFX906)
     const int em0 = exp_mode();
