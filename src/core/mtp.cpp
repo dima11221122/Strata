@@ -2,6 +2,7 @@
 #include "strata/core/mtp.hpp"
 #include "strata/artifact/mtp_expert_manifest.hpp"
 #include "strata/core/coupled_draft.hpp"
+#include "strata/core/draft_alignment_capture.hpp"
 #include "strata/core/on_device.hpp"
 
 #include "strata/core/native_head.hpp"
@@ -134,6 +135,20 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
 
 }  // namespace
 
+MtpDrafter::MtpDrafter() = default;
+
+void MtpDrafter::set_prompt_len(int64_t n) {
+    prompt_len_ = n;
+    if (alignment_) alignment_->begin_request();
+}
+
+bool MtpDrafter::observe_alignment(int T, int64_t p, const int32_t* window, const int32_t* targets,
+                                  const float* teacher_head, bool usable, int accepted, std::string& err) {
+    if (!alignment_) return true;
+    const OnDevice on_device(device_);
+    return alignment_->observe(T, p, window, targets, teacher_head, usable, accepted, err);
+}
+
 MtpDrafter::~MtpDrafter() {
     if (cs_) cudaStreamSynchronize(cs_);
     for (auto& e : prefill_exec_) if (e) cudaGraphExecDestroy(e);
@@ -150,6 +165,7 @@ MtpDrafter::~MtpDrafter() {
     if (h_cparams_) cudaFreeHost(h_cparams_);
     if (h_chist_) cudaFreeHost(h_chist_);
     if (cs_) cudaStreamDestroy(cs_);
+    alignment_.reset();
     if (dense_) cudaFree(dense_);
     if (experts_) cudaFree(experts_);
     if (state_arena_) cudaFree(state_arena_);
@@ -351,6 +367,13 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         cudaMemcpy(ident_, id.data(), id.size() * 4, cudaMemcpyHostToDevice);
     }
     if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) { err = "mtp: stream"; return false; }
+    if (const char* dir = std::getenv("STRATA_MTP_ALIGNMENT_DIR")) {
+        alignment_ = std::make_unique<DraftAlignmentCapture>();
+        if (!alignment_->init(dir, g.n_embd, g.hc, max_t_ - 1, err)) return false;
+        vram_ += alignment_->vram_bytes();
+        std::fprintf(stderr, "[mtp-alignment] state_bytes=%llu active=1\n",
+                     (unsigned long long) alignment_->vram_bytes());
+    }
     const double files_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_files).count();
     std::fprintf(stderr, "strata mtp: draft layer loaded, %.0f MiB of VRAM (experts %.0f, dense %.0f), files read in %.2f s (%.0f MiB/s)\n",
                  (double) vram_ / 1048576.0, (double) g.n_expert * expert_blob_ / 1048576.0,
@@ -821,6 +844,7 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
         coupled_j_ = 0;
         ok = record_forward(1, ra, cs_, err);
         coupled_rec_ = false;
+        if (ok && alignment_) ok = alignment_->snapshot(0, R_, sample_, cs_, err);
     }
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, 0, cs_, probs_, m_prob_);
     return finish_capture(cs_, ok, exec, coupled ? "round (coupled)" : "round", err);
@@ -841,6 +865,7 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     coupled_j_ = j;
     bool ok = record_forward(1, row, cs_, err);
     coupled_rec_ = false;
+    if (ok && alignment_) ok = alignment_->snapshot(j, R_, sample_, cs_, err);
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
     return finish_capture(cs_, ok, exec, coupled ? "step (coupled)" : "step", err);
 }
@@ -1077,6 +1102,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     }
     for (int j = n; j < max_t_ - 1; ++j) { drafts[j] = 0; if (probs) probs[j] = 0.0f; }
     if (n_drafts) *n_drafts = n;
+    if (alignment_) alignment_->remember(p + a + 1, n, drafts, h_prob_);
     ms_draft += ms_since(t0);
     ++rounds;
     return true;

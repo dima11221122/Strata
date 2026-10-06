@@ -197,6 +197,8 @@ public:
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
     const float* final_R_all() const { return next_ ? next_->final_R_all() : R_; }
+    /// Target head inputs [T,n_embd], valid after run() until the next run(). Diagnostic read-only access.
+    const float* head_input_all() const { return next_ ? next_->head_input_all() : head_mixed_; }
 
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.

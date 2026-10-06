@@ -7299,6 +7299,11 @@ int main(int argc, char** argv) {
                 const double delayed_apply_ms = apply_after_verify || refill_after_verify ? timed_apply_pending(true) : 0.0;
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                if (!mtp.observe_alignment(T, p, window.data(), outv.data(), ver.head_input_all(),
+                                           !from_sfx && req_sp.greedy && hist_n == 0, a, err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)

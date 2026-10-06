@@ -26,16 +26,18 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace strata::core {
 
 class NativeHead;
+class DraftAlignmentCapture;
 
 class MtpDrafter {
 public:
-    MtpDrafter() = default;
+    MtpDrafter();
     ~MtpDrafter();
     MtpDrafter(const MtpDrafter&) = delete;
     MtpDrafter& operator=(const MtpDrafter&) = delete;
@@ -45,7 +47,11 @@ public:
     bool load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
               int64_t window = 32768);
     /// The prompt's length: prefill() skips the cells the attention window can never reach again.
-    void set_prompt_len(int64_t n) { prompt_len_ = n; }
+    void set_prompt_len(int64_t n);
+    /// Diagnostic capture, off unless STRATA_MTP_ALIGNMENT_DIR names a fresh directory.
+    /// The next verifier window must consume the saved proposal prefix on the same device.
+    bool observe_alignment(int T, int64_t p, const int32_t* window, const int32_t* targets,
+                           const float* teacher_head, bool usable, int accepted, std::string& err);
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
     void set_max_drafts(int k) { max_drafts_ = k; }
     uint64_t vram_bytes() const { return vram_; }
@@ -137,6 +143,7 @@ private:
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
     cudaStream_t cs_ = nullptr;
+    std::unique_ptr<DraftAlignmentCapture> alignment_;
     cudaGraphExec_t prefill_exec_[9] = {};
     cudaGraphExec_t prefill_dev_exec_[9] = {};
     int32_t* pf_dev_ = nullptr;   ///< E-4: a prompt's rows' token / step / position records, uploaded at once
