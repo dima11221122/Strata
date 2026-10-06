@@ -1099,6 +1099,8 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
                                      "checks (#375): the default read is used\n");
             cudaGetLastError();   // drop any error the attempts left behind
             split3[dev3] = split;
+            if (split == 1)
+                std::fprintf(stderr, "[gr-v3] width=%d shared_bytes=%d split=1 active=1\n", kFusedGrMaxT, need1);
         }
     }
     const int split = v3 && dev3 >= 0 && dev3 < 64 ? split3[dev3] : -1;

@@ -446,6 +446,20 @@ The fresh basic control/candidate/control bracket completed at02:13 UTC on Octob
 
 The canonical draft directory was restored and loaded health/Pi configuration checked. The signed option remains disabled. No full alternation, numerical/quality regression, confidence/depth sweep or down-role extension followed this failure. Basic reports are excluded from the147-report full ledger;90 tokens/s remains unproven.
 
+### Existing two-kernel hyper-connection read
+
+The existing default-off `STRATA_GR_V3=1` path uses two kernels instead of the retained staged path's three, with a different FP32 reduction order. This fork adds only a once-per-device activation record after successful one-stream-split attributes. CUDA reports101376 opt-in shared bytes/block on this RTX5060Ti; the maximum-width-eight path requires81920, so it fits. The two-half split that upstream rejected for graph/direct parity is not used. No arithmetic, checkpoint bytes or persistent allocation was added. Source review of the record/harness found no issues and does not establish runtime parity.
+
+An engine-only build `03173c6d98ee7b68fd87f5864f113e8787699cd308b3f1a3b9bf2e31780d99c7` and fresh basic control/candidate/control bracket completed at02:29 UTC on October6. Rates were opening66.9/64.9/67.5, candidate64.3/64.2/68.7, closing63.5/63.6/65.2 tokens/s. Warm means **66.20/66.45/64.40** failed the required0.5 advantage over both controls. The candidate confirmed width8/shared81920/split1; controls emitted no activation. All arms retained4601 slots/8.77 GiB/40525 draft rows/700 MiB configured reserve/519 MiB ready free. Post-generation free was431/433/431 MiB. Candidate answers and aggregate draft totals changed; no ordered work digest was collected. The result does not isolate execution cost under identical work.
+
+V3 remains disabled; no full alternation, numerical/quality regression or split sweep followed. The validated3378 executable and retained configuration were restored. Basic reports stay outside the147-report full ledger;90 tokens/s remains unproven.
+
+### Draft alignment research scope
+
+[DistillSpec](https://arxiv.org/abs/2310.08461) and [Draft-OPD](https://arxiv.org/abs/2605.29343) motivate supervision on draft-induced states. [EAGLE-3](https://arxiv.org/abs/2503.01840) removes feature prediction constraints in favor of token prediction. Its [official training loop](https://github.com/SafeAILab/EAGLE/blob/cb7e0841fe0c206c6ed74a197ad5e2a1f13f5a2b/eagle/traineagle3/cnets.py#L785) masks teacher argmaxes outside the draft vocabulary and uses detached restricted teacher probabilities across successive student steps. Those transformer architectures differ from this canonicalQ2 MTP; their published gains are not forecasts here. Indexed paper sections and selected implementation loops were studied, not all full papers or repositories. No reference training code was executed or imported.
+
+A narrower feasibility design would train the existing6,563,840-parameter MTP final mixer and retain its inference layout. Correct examples require each proposal's complete mixer input paired with the NEXT verifier window's row, including rejected draft prefixes. Catch-up rows and suffix windows need separate handling. CanonicalQ2 experts use Q8_0_scaled/S2, whereas the final head uses Q8_1; a generic full-precision forward cannot be claimed identical. No dataset capture, trainer, trained candidate or performance result exists yet.
+
 ### Recent CPU IQ kernel applicability
 
 The [primary llama.cpp tiled source](https://github.com/ggml-org/llama.cpp/blob/50569eb87df530daff11afda229ceb9ab8e6cae8/ggml/src/ggml-cpu/tiled/tiled.cpp) supports canonical IQ3_S, but its profitability gate is at least eight inputs per expert. The retained verifier has at most six total inputs; expert groups are often smaller. Its large-batch path is therefore not imported or forced based on prompt-processing speedups.
