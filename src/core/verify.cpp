@@ -1374,7 +1374,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (head_ != nullptr && head_->loaded()) {
             try {
                 native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
-                native_mmvq(head_->type(), head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T, cs);
+                head_->project_q8(xq_, head_logits_, T, cs);
             } catch (const std::exception& e) {
                 err = std::string("verify head: ") + e.what();
                 return false;

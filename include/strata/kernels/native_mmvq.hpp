@@ -95,6 +95,15 @@ void native_q6_k_gather_aligned(const void* weights, const int* row_ids, void* a
 void native_q6_k_aligned_mmvq(const void* aligned, const void* x_q8_1, float* y,
                               int n_in, int n_out, void* stream);
 
+// Internal lossless Q6 layout: signed coefficient bytes, unchanged scales/d, 276 bytes/block.
+// Gathering reconstructs canonical Q6 rows; row ids must be in range of the source head.
+std::size_t native_q6_k_predecoded_bytes(int n_in, int n_out);
+void native_q6_k_predecode(const void* canonical, void* predecoded, int n_in, int n_out, void* stream);
+void native_q6_k_gather_canonical(const void* predecoded, const int32_t* row_ids, void* canonical,
+                                int n_in, int n_out, void* stream);
+void native_q6_k_predecoded_mmvq(const void* predecoded, const void* x_q8_1, float* y,
+                               int n_in, int n_out, int ncols, void* stream);
+
 void native_q6_k_f32(const void* weights, const float* x, void* scratch_q8_1,
                      float* y, int n_in, int n_out, int ncols, void* stream);
 

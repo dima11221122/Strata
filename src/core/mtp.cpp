@@ -494,21 +494,23 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
         std::vector<uint8_t> raw;
         if (read_file(rt_dir_ + "/draft_vocab.bin", raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
             n_dvocab_ = (int64_t) (raw.size() / 4);
-            const int64_t row_bytes = (int64_t) head->row_bytes();   // a vocabulary row of the native head
+            const int64_t row_bytes = (int64_t) head->row_bytes();   // canonical draft row, regardless of target storage
             const bool aligned = aligned_draft_head() && head->type() == 14;
+            const bool predecoded = head->q6_predecoded();
+            if (aligned && predecoded) { err = "mtp: aligned and predecoded head probes cannot be combined"; return false; }
             uint64_t head_bytes = (uint64_t) (n_dvocab_ * row_bytes);
-            if (aligned) {
+            if (aligned || predecoded) {
                 const char* single = std::getenv("STRATA_Q6_ROW_WARP_SINGLE");
                 if (n_dvocab_ > INT_MAX || (single && std::atoi(single) != 0)) {
-                    err = "mtp: aligned Q6 head requires int32 rows and the generic single-column layout";
+                    err = "mtp: Q6 head gather requires int32 rows and the generic draft single-column layout";
                     return false;
                 }
                 for (size_t i = 0; i < raw.size(); i += sizeof(int32_t)) {
                     int32_t id;
                     std::memcpy(&id, raw.data() + i, sizeof(id));
-                    if (id < 0 || id >= n_vocab_) { err = "mtp: aligned Q6 head vocabulary id out of range"; return false; }
+                    if (id < 0 || id >= n_vocab_) { err = "mtp: Q6 head vocabulary id out of range"; return false; }
                 }
-                head_bytes = strata::kernels::native_q6_k_aligned_bytes((int) g_->n_embd, (int) n_dvocab_);
+                if (aligned) head_bytes = strata::kernels::native_q6_k_aligned_bytes((int) g_->n_embd, (int) n_dvocab_);
             }
             if (cudaMalloc((void**) &dvocab_, raw.size()) != cudaSuccess ||
                 cudaMalloc((void**) &dhead_, head_bytes) != cudaSuccess) {
@@ -516,21 +518,26 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 draft_head_hint(n_dvocab_, row_bytes);
                 return false;
             }
-            if (aligned) {
+            if (aligned || predecoded) {
                 if (cudaMemcpyAsync(dvocab_, raw.data(), raw.size(), cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
                     cudaStreamSynchronize(cs_);
-                    err = "mtp: aligned Q6 vocabulary upload failed"; return false;
+                    err = "mtp: Q6 vocabulary upload failed"; return false;
                 }
                 try {
-                    strata::kernels::native_q6_k_gather_aligned(head->weights(), dvocab_, dhead_,
-                        (int) g_->n_embd, (int) n_dvocab_, cs_);
+                    if (predecoded)
+                        strata::kernels::native_q6_k_gather_canonical(head->weights(), dvocab_, dhead_,
+                            (int) g_->n_embd, (int) n_dvocab_, cs_);
+                    else
+                        strata::kernels::native_q6_k_gather_aligned(head->weights(), dvocab_, dhead_,
+                            (int) g_->n_embd, (int) n_dvocab_, cs_);
                 } catch (const std::exception& e) {
                     cudaStreamSynchronize(cs_);   // raw vocabulary remains alive through submitted work
-                    err = std::string("mtp: aligned Q6 gather: ") + e.what(); return false;
+                    err = std::string("mtp: Q6 head gather: ") + e.what(); return false;
                 }
-                if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: aligned Q6 gather failed"; return false; }
-                dhead_aligned_ = true;
-                std::fprintf(stderr, "[mtp-q6-aligned] block_bytes=212 rows=%lld bytes=%llu\n",
+                if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: Q6 head gather failed"; return false; }
+                dhead_aligned_ = aligned;
+                std::fprintf(stderr, "[%s] block_bytes=%d rows=%lld bytes=%llu\n",
+                    predecoded ? "mtp-q6-canonical" : "mtp-q6-aligned", predecoded ? 210 : 212,
                     (long long) n_dvocab_, (unsigned long long) head_bytes);
             } else {
                 cudaMemcpy(dvocab_, raw.data(), raw.size(), cudaMemcpyHostToDevice);
@@ -724,7 +731,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         const bool sub = dhead_ != nullptr;
         const int64_t nv = sub ? n_dvocab_ : n_vocab_;
         if (dhead_aligned_) native_q6_k_aligned_mmvq(dhead_, xq_, head_logits_, (int) N, (int) nv, cs);
-        else native_mmvq(head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
+        else if (sub) native_mmvq(head_->type(), dhead_, xq_, head_logits_, (int) N, (int) nv, T, cs);
+        else head_->project_q8(xq_, head_logits_, T, cs);
         if (coupled_rec_) {
             // coupled draft sampling: the target's chain and Philox draw for the row that will verify this draft
             // (counter = this cell + 1, from its step record), penalties over the ring; T == 1 (full layer)

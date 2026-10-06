@@ -21,13 +21,19 @@ public:
 
     bool load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err);
     bool run(const float* mixed, float* logits, void* stream, std::string& err) const;
+    /// Layout-aware projection of already quantized Q8_1 columns; throws on invalid launches.
+    void project_q8(const void* quantized, float* logits, int ncols, void* stream) const;
     uint64_t weight_bytes() const { return bytes_; }
     bool loaded() const { return weights_ != nullptr; }
-    /// Plan v0.3 P6: the GGUF blocks, for the verify window's multi-column head.
+    /// Native storage; q6_predecoded() identifies the internal lossless Q6 alternative.
     const void* weights() const { return weights_; }
     int type() const { return type_; }
-    /// Bytes of one vocabulary row.
-    size_t row_bytes() const { return n_out_ > 0 ? (size_t) (bytes_ / (uint64_t) n_out_) : 0; }
+    bool q6_predecoded() const { return q6_predecoded_; }
+    /// Canonical GGUF bytes of a draft vocabulary row, independent of target storage.
+    size_t row_bytes() const {
+        return canonical_row_bytes_ ? canonical_row_bytes_
+                                    : (n_out_ > 0 ? (size_t) (bytes_ / (uint64_t) n_out_) : 0);
+    }
 
 private:
     void* weights_ = nullptr;
@@ -35,6 +41,8 @@ private:
     uint64_t bytes_ = 0;
     int n_in_ = 0, n_out_ = 0;
     int type_ = -1;
+    size_t canonical_row_bytes_ = 0;
+    bool q6_predecoded_ = false;
 };
 
 /// Plan v0.3 P6: `token_embd.weight` in its GGUF form (the IQ model files), in mapped pinned host memory: a row

@@ -95,6 +95,12 @@ struct alignas(4) Q6KAlignedBlock {
     half d;
     uint16_t padding;
 };
+struct alignas(4) Q6KPredecodedBlock {
+    uint32_t qs[64];  // Four original signed Q6 coefficients per word, in logical column order.
+    int8_t scales[16];
+    half d;
+    uint16_t padding;
+};
 struct Q40Block {
     half d;
     uint8_t qs[16];
@@ -130,6 +136,8 @@ static_assert(sizeof(Q6KBlock) == 210 && alignof(Q6KBlock) == 2 &&
 static_assert(sizeof(Q6KAlignedBlock) == 212 && alignof(Q6KAlignedBlock) == 4 &&
               offsetof(Q6KAlignedBlock, qh) == 128 && offsetof(Q6KAlignedBlock, scales) == 192 &&
               offsetof(Q6KAlignedBlock, d) == 208);
+static_assert(sizeof(Q6KPredecodedBlock) == 276 && alignof(Q6KPredecodedBlock) == 4 &&
+              offsetof(Q6KPredecodedBlock, scales) == 256 && offsetof(Q6KPredecodedBlock, d) == 272);
 static_assert(sizeof(Q40Block) == 18 && alignof(Q40Block) == 2 && offsetof(Q40Block, qs) == 2);
 static_assert(sizeof(Q50Block) == 22 && alignof(Q50Block) == 2 &&
               offsetof(Q50Block, qh) == 2 && offsetof(Q50Block, qs) == 6);
@@ -631,6 +639,16 @@ __global__ void native_q4_k_mmvq_kernel(const Q4KBlock* __restrict__ w,
     }
 }
 
+// Four consecutive original signed Q6 coefficients. Used only for startup packing and MMA.
+__device__ __forceinline__ unsigned q6_signed_word(const Q6KBlock* w, int col) {
+    const int region = col / 128, quarter = (col % 128) / 32, offset = col % 32;
+    const unsigned low = unsigned(load_int_b2(w->ql, (region * 64 + (quarter & 1) * 32 + offset) / 4));
+    const unsigned high = unsigned(load_int_b2(w->qh, (region * 32 + offset) / 4));
+    const unsigned values = ((low >> (4 * (quarter / 2))) & 0x0f0f0f0fu) |
+                            (((high >> (2 * quarter)) & 0x03030303u) << 4);
+    return unsigned(__vsubss4(int(values), 0x20202020));
+}
+
 // Exact pinned vec_dot_q6_K_q8_1: keep signed per-16-element scales,
 // signed-byte subtraction, DP4A order, and the float accumulation sequence.
 __device__ __forceinline__ float q6_q8_dot_impl(int vl, int vh, const int* __restrict__ u,
@@ -669,6 +687,78 @@ __device__ __forceinline__ float q6_q8_dot(const Block* __restrict__ w,
         d8[i] = __low2float(x[bq8_offset + 2 * i].ds);
     }
     return q6_q8_dot_impl(vl, vh, u, w->scales + scale_offset, w->d, d8);
+}
+
+struct Q6KPredecodedTraits {
+    using Block = Q6KPredecodedBlock;
+    static constexpr int DIV = 256, T = 32, KBY = 8, BPI = WARPS * WARP / 32;
+    __device__ static int kqs(int tid) { return tid % 32; }
+    struct W { int v[2], sc[2], bq8_offset; float d; };
+    __device__ static W load(const Block* __restrict__ w, int iqs) {
+        W r;
+        r.bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;
+        const int scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
+        r.d = w->d;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            r.v[i] = int(w->qs[8 * (r.bq8_offset + 2 * i) + iqs % 8]);
+            r.sc[i] = w->scales[scale_offset + 4 * i];
+        }
+        return r;
+    }
+    __device__ static float apply(const W& r, const Q81Block* __restrict__ x, int iqs) {
+        float sumf = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const auto& chunk = x[r.bq8_offset + 2 * i];
+            const int u = reinterpret_cast<const int*>(chunk.qs)[iqs % 8];
+            // Keep q6_q8_dot_impl's integer scaling and float accumulation order.
+            sumf += __low2float(chunk.ds) * (STRATA_DP4A(r.v[i], u, 0) * r.sc[i]);
+        }
+        return r.d * sumf;
+    }
+};
+
+__device__ __forceinline__ float q6_q8_dot(const Q6KPredecodedBlock* __restrict__ w,
+                                          const Q81Block* __restrict__ x, int iqs) {
+    return Q6KPredecodedTraits::apply(Q6KPredecodedTraits::load(w, iqs), x, iqs);
+}
+
+__global__ void q6_predecode_kernel(const Q6KBlock* __restrict__ src,
+                                   Q6KPredecodedBlock* __restrict__ dst, std::size_t words) {
+    for (std::size_t word = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         word < words; word += std::size_t(gridDim.x) * blockDim.x) {
+        const std::size_t block = word / 64;
+        const int k = int(word % 64);
+        dst[block].qs[k] = q6_signed_word(src + block, 4 * k);
+        if (k < 16) dst[block].scales[k] = src[block].scales[k];
+        if (k == 0) { dst[block].d = src[block].d; dst[block].padding = 0; }
+    }
+}
+
+__global__ void q6_gather_canonical_kernel(const Q6KPredecodedBlock* __restrict__ src,
+    const int32_t* __restrict__ ids, Q6KBlock* __restrict__ dst, int blocks_per_row, std::size_t count) {
+    for (std::size_t block = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         block < count; block += std::size_t(gridDim.x) * blockDim.x) {
+        const auto& from = src[std::size_t(ids[block / blocks_per_row]) * blocks_per_row + block % blocks_per_row];
+        auto& to = dst[block];
+        const auto* q = reinterpret_cast<const int8_t*>(from.qs);
+        for (int i = 0; i < 128; ++i) {
+            const int col = (i / 64) * 128 + i % 64;
+            to.ql[i] = uint8_t(((int(q[col]) + 32) & 15) | (((int(q[col + 64]) + 32) & 15) << 4));
+        }
+        for (int i = 0; i < 64; ++i) {
+            const int col = (i / 32) * 128 + i % 32;
+            unsigned high = 0;
+#pragma unroll
+            for (int quarter = 0; quarter < 4; ++quarter)
+                high |= unsigned((int(q[col + 32 * quarter]) + 32) >> 4) << (2 * quarter);
+            to.qh[i] = uint8_t(high);
+        }
+#pragma unroll
+        for (int i = 0; i < 16; ++i) to.scales[i] = from.scales[i];
+        to.d = from.d;
+    }
 }
 
 // Q6_K generic MMVQ: QK=256, QI=32, VDR=1, four blocks per iteration.
@@ -1111,9 +1201,9 @@ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w
 // Experimental Q6_K layout: each warp owns one or two complete output rows, eliminating
 // the cross-warp shared-memory reduction. The quantized dot remains unchanged;
 // accumulating blocks in one warp changes floating-point summation order.
-template<int NCOLS, int ROWS = 1>
+template<int NCOLS, int ROWS = 1, typename F = Q6KTraits>
 __launch_bounds__(WARPS * WARP, 4)
-__global__ void native_q6_k_rowwarp_kernel(const Q6KBlock* __restrict__ w,
+__global__ void native_q6_k_rowwarp_kernel(const typename F::Block* __restrict__ w,
                                           const Q81Block* __restrict__ x,
                                           float* __restrict__ y, int n_in, int n_out) {
     const int lane = int(threadIdx.x);
@@ -1126,10 +1216,10 @@ __global__ void native_q6_k_rowwarp_kernel(const Q6KBlock* __restrict__ w,
 #pragma unroll
         for (int r = 0; r < ROWS; ++r) {
             if (row + r >= n_out) continue;
-            const auto weight = Q6KTraits::load(w + std::size_t(row + r) * blocks_per_row + kb, lane);
+            const auto weight = F::load(w + std::size_t(row + r) * blocks_per_row + kb, lane);
 #pragma unroll
             for (int j = 0; j < NCOLS; ++j)
-                acc[r][j] += Q6KTraits::apply(weight, x + std::size_t(j) * x_stride + kb * 8, lane);
+                acc[r][j] += F::apply(weight, x + std::size_t(j) * x_stride + kb * 8, lane);
         }
     }
 #pragma unroll
@@ -1146,12 +1236,7 @@ __global__ void native_q6_k_rowwarp_kernel(const Q6KBlock* __restrict__ w,
 #if defined(__CUDACC__) && !defined(__HIPCC__)
 // Four consecutive original Q6 values. Blocks have only two-byte alignment.
 __device__ __forceinline__ unsigned q6_mma_word(const Q6KBlock* w, int col) {
-    const int region = col / 128, quarter = (col % 128) / 32, offset = col % 32;
-    const unsigned low = unsigned(load_int_b2(w->ql, (region * 64 + (quarter & 1) * 32 + offset) / 4));
-    const unsigned high = unsigned(load_int_b2(w->qh, (region * 32 + offset) / 4));
-    const unsigned values = ((low >> (4 * (quarter / 2))) & 0x0f0f0f0fu) |
-                            (((high >> (2 * quarter)) & 0x03030303u) << 4);
-    return unsigned(__vsubss4(int(values), 0x20202020));
+    return q6_signed_word(w, col);
 }
 
 template<int NCOLS>
@@ -1248,8 +1333,9 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
     const auto* w = static_cast<const typename F::Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
     bool compact_q6 = false;
-    if constexpr (std::is_same_v<F, Q6KTraits>) {
+    if constexpr (std::is_same_v<F, Q6KTraits> || std::is_same_v<F, Q6KPredecodedTraits>) {
 #if defined(__CUDACC__) && !defined(__HIPCC__)
+        if constexpr (std::is_same_v<F, Q6KTraits>) {
         if (NCOLS >= 2 && n_in % QK == 0 && n_out >= 16 && q6_int8_mma_enabled()) {
             static const bool reported = [] {
                 cudaFuncAttributes attr{};
@@ -1264,6 +1350,7 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
             native_q6_k_int8_mma_kernel<NCOLS><<<blocks, dim3(WARP, WARPS), 0, s>>>(w, x, y, n_in, n_out);
             return;
         }
+        }
 #endif
         static const bool rowwarp = [] {
             const char* value = std::getenv("STRATA_Q6_ROW_WARP");
@@ -1276,10 +1363,10 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
             }();
             if (two_rows) {
                 const unsigned blocks = unsigned((std::size_t(n_out) + 2 * WARPS - 1) / (2 * WARPS));
-                native_q6_k_rowwarp_kernel<NCOLS, 2><<<blocks, dim3(WARP, WARPS), 0, s>>>(w, x, y, n_in, n_out);
+                native_q6_k_rowwarp_kernel<NCOLS, 2, F><<<blocks, dim3(WARP, WARPS), 0, s>>>(w, x, y, n_in, n_out);
             } else {
                 const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-                native_q6_k_rowwarp_kernel<NCOLS><<<blocks, dim3(WARP, WARPS), 0, s>>>(w, x, y, n_in, n_out);
+                native_q6_k_rowwarp_kernel<NCOLS, 1, F><<<blocks, dim3(WARP, WARPS), 0, s>>>(w, x, y, n_in, n_out);
             }
             return;
         }
@@ -1731,42 +1818,83 @@ void native_q6_k_aligned_mmvq(const void* aligned, const void* x_q8_1, float* y,
     launch_check();
 }
 
-void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
-                      int n_in, int n_out, int ncols, void* stream) {
+template<typename F>
+void q6_mmvq_layout(const void* weights, const void* x_q8_1, float* y,
+                    int n_in, int n_out, int ncols, void* stream) {
     validate_shape(n_in, ncols, 256);
     if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
     validate_pointer(weights);
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
-    STRATA_WAVE_MMVQ(Q6KTraits)
+    STRATA_WAVE_MMVQ(F)
     static const bool single_rowwarp = [] {
         const char* value = std::getenv("STRATA_Q6_ROW_WARP_SINGLE");
         return value && std::atoi(value) != 0;
     }();
     if (ncols == 1 && single_rowwarp) {
         const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-        native_q6_k_rowwarp_kernel<1><<<blocks, dim3(WARP, WARPS), 0, static_cast<cudaStream_t>(stream)>>>(
-            static_cast<const Q6KBlock*>(weights), static_cast<const Q81Block*>(x_q8_1), y, n_in, n_out);
+        native_q6_k_rowwarp_kernel<1, 1, F><<<blocks, dim3(WARP, WARPS), 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<const typename F::Block*>(weights), static_cast<const Q81Block*>(x_q8_1), y, n_in, n_out);
         launch_check();
         return;
     }
     if (ncols > 1) {
-        launch_multi<Q6KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
+        launch_multi<F>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         launch_check();
         return;
     }
-    const auto* w = static_cast<const Q6KBlock*>(weights);
+    const auto* w = static_cast<const typename F::Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
     const auto s = static_cast<cudaStream_t>(stream);
     const dim3 threads(WARP, WARPS);
     if (n_in / 256 < WARPS * WARP / 32) {
         const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-        native_q6_k_mmvq_kernel<true><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out);
+        native_q6_k_mmvq_kernel<true, typename F::Block><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out);
     } else {
-        native_q6_k_mmvq_kernel<false><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out);
+        native_q6_k_mmvq_kernel<false, typename F::Block><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out);
     }
     launch_check();
+}
+
+void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
+                      int n_in, int n_out, int ncols, void* stream) {
+    q6_mmvq_layout<Q6KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
+}
+
+std::size_t native_q6_k_predecoded_bytes(int n_in, int n_out) {
+    validate_shape(n_in, 1, QK);
+    if (n_out <= 0) throw std::invalid_argument("predecoded Q6 requires n_out > 0");
+    const std::size_t blocks = std::size_t(n_in / QK) * std::size_t(n_out);
+    if (blocks > std::numeric_limits<std::size_t>::max() / sizeof(Q6KPredecodedBlock))
+        throw std::overflow_error("predecoded Q6 byte count overflows");
+    return blocks * sizeof(Q6KPredecodedBlock);
+}
+
+void native_q6_k_predecode(const void* canonical, void* predecoded, int n_in, int n_out, void* stream) {
+    const std::size_t words = native_q6_k_predecoded_bytes(n_in, n_out) / sizeof(Q6KPredecodedBlock) * 64;
+    validate_pointer(canonical); validate_pointer(predecoded); validate_stream(stream);
+    const unsigned grid = unsigned(std::min<std::size_t>((words + 255) / 256, 4096));
+    q6_predecode_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const Q6KBlock*>(canonical), static_cast<Q6KPredecodedBlock*>(predecoded), words);
+    launch_check();
+}
+
+void native_q6_k_gather_canonical(const void* predecoded, const int32_t* row_ids, void* canonical,
+                                int n_in, int n_out, void* stream) {
+    const std::size_t count = native_q6_k_predecoded_bytes(n_in, n_out) / sizeof(Q6KPredecodedBlock);
+    validate_pointer(predecoded); validate_pointer(row_ids); validate_pointer(canonical); validate_stream(stream);
+    const unsigned grid = unsigned(std::min<std::size_t>((count + 255) / 256, 4096));
+    q6_gather_canonical_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const Q6KPredecodedBlock*>(predecoded), row_ids, static_cast<Q6KBlock*>(canonical),
+        n_in / QK, count);
+    launch_check();
+}
+
+void native_q6_k_predecoded_mmvq(const void* predecoded, const void* x_q8_1, float* y,
+                               int n_in, int n_out, int ncols, void* stream) {
+    native_q6_k_predecoded_bytes(n_in, n_out);
+    q6_mmvq_layout<Q6KPredecodedTraits>(predecoded, x_q8_1, y, n_in, n_out, ncols, stream);
 }
 
 void native_q6_k_f32(const void* weights, const float* x, void* scratch_q8_1,

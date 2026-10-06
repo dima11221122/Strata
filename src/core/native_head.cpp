@@ -4,12 +4,26 @@
 #include "strata/kernels/native_mmvq.hpp"
 
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <climits>
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <cstdlib>
+#include <stdexcept>
 
 namespace strata::core {
+
+namespace {
+bool predecode_q6_head() {
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+    return false;
+#else
+    const char* value = std::getenv("STRATA_HEAD_Q6_PREDECODE");
+    return value && std::atoi(value) != 0;
+#endif
+}
+}  // namespace
 
 NativeHead::~NativeHead() {
     if (scratch_) cudaFree(scratch_);
@@ -55,9 +69,66 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
             err = std::string("native head upload: ") + cudaGetErrorString(status);
             return false;
         }
+        uint64_t stored_bytes = bytes;
+        bool predecoded = false;
+        if (predecode_q6_head() && tensor->type == 14) {
+            const auto enabled = [](const char* name) {
+                const char* value = std::getenv(name); return value && std::atoi(value) != 0;
+            };
+            if (enabled("STRATA_Q6_INT8_MMA") || enabled("STRATA_MTP_Q6_ALIGNED")) {
+                cudaFree(scratch); cudaFree(weights);
+                err = "native head Q6 predecode excludes MMA and aligned draft-head probes";
+                return false;
+            }
+            void* expanded = nullptr;
+            cudaStream_t convert = nullptr;
+            size_t free_before = 0, total = 0, free_during = 0, free_converted = 0, free_after = 0;
+            bool launch_failed = false;
+            try {
+                stored_bytes = strata::kernels::native_q6_k_predecoded_bytes((int) n_in, (int) n_out);
+                status = cudaMemGetInfo(&free_before, &total);
+                if (status == cudaSuccess) status = cudaStreamCreateWithFlags(&convert, cudaStreamNonBlocking);
+                if (status == cudaSuccess) status = cudaMalloc(&expanded, stored_bytes);
+                if (status == cudaSuccess) status = cudaMemGetInfo(&free_during, &total);
+                if (status == cudaSuccess)
+                    strata::kernels::native_q6_k_predecode(weights, expanded, (int) n_in, (int) n_out, convert);
+            } catch (const std::exception& error) {
+                err = std::string("native head Q6 predecode: ") + error.what();
+                launch_failed = true;
+            }
+            if (convert) {
+                const cudaError_t sync = cudaStreamSynchronize(convert);
+                if (status == cudaSuccess) status = sync;
+                cudaStreamDestroy(convert);
+            }
+            if (status == cudaSuccess && !launch_failed) status = cudaMemGetInfo(&free_converted, &total);
+            if (status != cudaSuccess || launch_failed) {
+                if (expanded) cudaFree(expanded);
+                cudaFree(scratch); cudaFree(weights);
+                if (err.empty()) err = std::string("native head Q6 predecode: ") + cudaGetErrorString(status);
+                return false;
+            }
+            cudaFree(weights);  // Conversion is complete; no graph or consumer has seen this head yet.
+            weights = expanded;
+            predecoded = true;
+            status = cudaMemGetInfo(&free_after, &total);
+            if (status != cudaSuccess) {
+                cudaFree(scratch); cudaFree(weights);
+                err = std::string("native head Q6 memory measurement: ") + cudaGetErrorString(status);
+                return false;
+            }
+            std::fprintf(stderr, "[head-q6-predecode] block_bytes=276 rows=%lld canonical_bytes=%llu bytes=%llu "
+                                 "free_before/during/after_mib=%.1f/%.1f/%.1f converted_mib=%.1f min_observed_mib=%.1f\n",
+                (long long) n_out, (unsigned long long) bytes, (unsigned long long) stored_bytes,
+                double(free_before) / 1048576., double(free_during) / 1048576., double(free_after) / 1048576.,
+                double(free_converted) / 1048576.,
+                double(std::min({free_before, free_during, free_converted, free_after})) / 1048576.);
+        }
         weights_ = weights;
         scratch_ = scratch;
-        bytes_ = bytes;
+        bytes_ = stored_bytes;
+        canonical_row_bytes_ = (size_t) (bytes / (uint64_t) n_out);
+        q6_predecoded_ = predecoded;
         n_in_ = (int) n_in;
         n_out_ = (int) n_out;
         type_ = (int) tensor->type;
@@ -78,7 +149,7 @@ bool NativeHead::run(const float* mixed, float* logits, void* stream, std::strin
             strata::kernels::native_q5_k_f32(weights_, mixed, scratch_, logits, n_in_, n_out_, 1, stream);
         } else {
             strata::kernels::native_quantize_q8_1(mixed, scratch_, n_in_, 1, stream);
-            strata::kernels::native_mmvq(type_, weights_, scratch_, logits, n_in_, n_out_, 1, stream);
+            project_q8(scratch_, logits, 1, stream);
         }
     } catch (const std::exception& error) {
         err = std::string("native head launch: ") + error.what();
@@ -90,6 +161,14 @@ bool NativeHead::run(const float* mixed, float* logits, void* stream, std::strin
         return false;
     }
     return true;
+}
+
+void NativeHead::project_q8(const void* quantized, float* logits, int ncols, void* stream) const {
+    if (!loaded()) throw std::invalid_argument("native head projection requires loaded weights");
+    if (q6_predecoded_)
+        strata::kernels::native_q6_k_predecoded_mmvq(weights_, quantized, logits, n_in_, n_out_, ncols, stream);
+    else
+        strata::kernels::native_mmvq(type_, weights_, quantized, logits, n_in_, n_out_, ncols, stream);
 }
 
 // ================================ plan v0.3 P6: THE NATIVE EMBEDDING ================================
