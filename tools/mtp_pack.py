@@ -6,8 +6,10 @@ no longer on this PC, so Strata packs its own from the 31 `mtp.*` tensors fetche
     python tools/mtp_pack.py --src Desktop/Strata/mtp-bf16 --experts q2_0 --out mtp-q2_0.gguf
     python tools/mtp_pack.py --src ... --experts q4_0 --out mtp-q4_0.gguf       (acceptance comparison arm)
     python tools/mtp_pack.py --src ... --experts q2_0 --q2-signed-gu --out mtp-q2-signed-gu.gguf
+    python tools/mtp_pack.py --src ... --experts q2_0 --q3-gu-lib /path/libggml-base.so --out mtp-q3-gu.gguf
 
 --q2-signed-gu is an experimental, default-off draft gate/up scale search; down and dense encoding stay canonical.
+--q3-gu-lib encodes only gate/up as reference Q3_K, preserving canonical Q2_0 down and dense encoding.
 
 Layout: dense tensors (attention, indexer, hyper-connections, shared expert, router, fc/norms) stay BF16 (F32 for
 1-D norms), ~0.18 GB. The routed experts keep the checkpoint's fused layout - `gate_up_proj` [512, 1280, 2560] and
@@ -25,6 +27,7 @@ by this file's reconstruction error, which is reported per tensor only as a sani
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import sys
@@ -123,6 +126,27 @@ def q5_0(w: np.ndarray) -> np.ndarray:
     return gguf.quantize(w.astype(np.float32), gguf.GGMLQuantizationType.Q5_0).reshape(-1)
 
 
+class Q3KReference:
+    """Offline GGML reference encoder; the runtime does not load this library."""
+    def __init__(self, library: str):
+        self.path = Path(library).resolve(strict=True)
+        self.library = ctypes.CDLL(str(self.path))
+        self.encode = self.library.quantize_row_q3_K_ref
+        self.encode.argtypes = [ctypes.POINTER(ctypes.c_float), ctypes.c_void_p, ctypes.c_int64]
+        self.encode.restype = None
+
+    def __call__(self, w: np.ndarray) -> np.ndarray:
+        if w.ndim < 1 or w.shape[-1] <= 0 or w.shape[-1] % 256:
+            raise ValueError("Q3_K gate/up rows must contain complete 256-value blocks")
+        x = np.ascontiguousarray(w, dtype=np.float32)
+        if not np.isfinite(x).all():
+            raise ValueError("Q3_K source weights must be finite")
+        out = np.empty(x.size // 256 * 110, dtype=np.uint8)
+        self.encode(x.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    ctypes.c_void_p(out.ctypes.data), ctypes.c_int64(x.size))
+        return out
+
+
 def q8_0(w: np.ndarray) -> np.ndarray:
     x = w.reshape(-1, 32).astype(np.float32)
     d = np.abs(x).max(axis=1, keepdims=True) / 127.0
@@ -135,8 +159,9 @@ def q8_0(w: np.ndarray) -> np.ndarray:
 
 
 def dequant(kind: str, blob: np.ndarray, n: int) -> np.ndarray:
-    if kind == "q5_0":
-        return gguf.dequantize(blob, gguf.GGMLQuantizationType.Q5_0).reshape(-1)[:n]
+    if kind in ("q5_0", "q3_k"):
+        ty = gguf.GGMLQuantizationType.Q3_K if kind == "q3_k" else gguf.GGMLQuantizationType.Q5_0
+        return gguf.dequantize(blob, ty).reshape(-1)[:n]
     if kind == "q2_0":
         b = blob.reshape(-1, 18)
         d = b[:, :2].copy().view(np.float16).astype(np.float32)
@@ -166,10 +191,14 @@ def main() -> int:
     ap.add_argument("--experts", choices=sorted(QUANT), default="q2_0")
     ap.add_argument("--out", required=True)
     ap.add_argument("--q2-signed-gu", action="store_true", help="allow signed Q2_0 scales for draft gate/up only")
+    ap.add_argument("--q3-gu-lib", help="GGML reference library: Q3_K gate/up with canonical Q2_0 down")
     ap.add_argument("--check-experts", type=int, default=8, help="experts per tensor used for the error report")
     a = ap.parse_args()
     if a.q2_signed_gu and a.experts != "q2_0":
         ap.error("--q2-signed-gu requires --experts q2_0")
+    if a.q3_gu_lib and (a.experts != "q2_0" or a.q2_signed_gu):
+        ap.error("--q3-gu-lib requires canonical --experts q2_0 without --q2-signed-gu")
+    q3_gu = Q3KReference(a.q3_gu_lib) if a.q3_gu_lib else None
     src = Path(a.src)
     manifest = json.loads((src / "mtp-manifest.json").read_text())
     fn, qtype, block, block_bytes = QUANT[a.experts]
@@ -177,8 +206,11 @@ def main() -> int:
     w.add_string("strata.mtp.source", "Qwen/Qwen3.8-Flash-Next BF16 checkpoint, mtp.* tensors")
     w.add_string("strata.mtp.source_sha256", hashlib.sha256(
         json.dumps({t["name"]: t["sha256"] for t in manifest}, sort_keys=True).encode()).hexdigest())
-    w.add_string("strata.mtp.expert_format", a.experts)
-    w.add_string("strata.mtp.expert_quantizer", "signed GU per-block MSE scale search" if a.q2_signed_gu else
+    w.add_string("strata.mtp.expert_format", "q3_k-gu-q2_0-down" if q3_gu else a.experts)
+    if q3_gu:
+        w.add_string("strata.mtp.q3_reference_library_sha256", hashlib.sha256(q3_gu.path.read_bytes()).hexdigest())
+    w.add_string("strata.mtp.expert_quantizer", "GGML reference Q3_K GU; canonical Q2_0 down" if q3_gu else
+                 "signed GU per-block MSE scale search" if a.q2_signed_gu else
                  "per-block MSE scale search" if a.experts == "q2_0" else "ggml reference")
     report = []
     for t in sorted(manifest, key=lambda t: t["name"]):
@@ -189,19 +221,27 @@ def main() -> int:
             # float32, so it is never materialized whole.
             raw = np.memmap(src / t["file"], dtype="<u2", mode="r", shape=tuple(shape))
             x = _Experts(raw)
-            if shape[-1] % block:
-                raise ValueError(f"{name}: inner dim {shape[-1]} not a multiple of {block}")
-            quant = (lambda values: q2_0(values, allow_signed=True)) if a.q2_signed_gu and name == EXPERT_TENSORS[0] else fn
+            is_q3 = q3_gu is not None and name == EXPERT_TENSORS[0]
+            role_block, role_bytes = (256, 110) if is_q3 else (block, block_bytes)
+            role_type = gguf.GGMLQuantizationType.Q3_K if is_q3 else qtype
+            role_name = "q3_k" if is_q3 else a.experts
+            if shape[-1] % role_block:
+                raise ValueError(f"{name}: inner dim {shape[-1]} not a multiple of {role_block}")
+            quant = fn
+            if is_q3:
+                quant = q3_gu
+            elif a.q2_signed_gu and name == EXPERT_TENSORS[0]:
+                quant = lambda values: q2_0(values, allow_signed=True)
             parts = [quant(x[e]) for e in range(shape[0])]         # one expert at a time bounds memory
             blob = np.concatenate(parts)
             errs = []
             for e in range(min(a.check_experts, shape[0])):
                 ref = x[e].reshape(-1)
-                got = dequant(a.experts, parts[e], ref.size)
+                got = dequant(role_name, parts[e], ref.size)
                 errs.append(float(np.sqrt(((got - ref) ** 2).mean()) / (np.sqrt((ref ** 2).mean()) + 1e-12)))
             # gguf-py takes the quantized bytes with the ELEMENT shape; ggml order is innermost-first.
-            w.add_tensor(name, blob, raw_shape=list(shape[:-1]) + [shape[-1] // block * block_bytes], raw_dtype=qtype)
-            report.append({"tensor": name, "format": a.experts, "bytes": int(blob.size),
+            w.add_tensor(name, blob, raw_shape=list(shape[:-1]) + [shape[-1] // role_block * role_bytes], raw_dtype=role_type)
+            report.append({"tensor": name, "format": role_name, "bytes": int(blob.size),
                            "relative_rms_error_first_experts": round(float(np.mean(errs)), 5),
                            "seconds": round(time.time() - t0, 1)})
         elif len(shape) == 1:

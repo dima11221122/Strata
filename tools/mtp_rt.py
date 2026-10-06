@@ -6,7 +6,8 @@ Writes
   experts.bin   512 routed experts in the engine's blob layout (`include/strata/kernels/cpu/expert.hpp`): gate/up
                 rows interleaved (2r = gate r, 2r+1 = up r), then down rows; the Q2_0 codes in one plane and the fp16
                 scales in another.  A lossless relayout of the GGUF's Q2_0 blocks (same bytes, `cpu_expert_fixture.py`).
-                Q5_0/Q8_0 use original GGUF blocks: gate rows, up rows, then down rows.
+                Native Q5_0/Q8_0 and mixed Q3_K GU/Q2_0 down use original GGUF blocks:
+                gate rows, up rows, then down rows.
   experts.txt   expert format and geometry; missing files retain the legacy Q2_0 path.
   dense.bin     every other tensor: the large projections quantized to Q8_0 (ggml's reference rounding) so the
                 engine's multi-column MMVQ can run them; the hyper-connection and router weights kept BF16; the
@@ -61,8 +62,14 @@ def blob_of(gu: np.ndarray, dn: np.ndarray) -> bytes:
 
 
 def native_blob_of(gu: np.ndarray, dn: np.ndarray, block_bytes: int) -> bytes:
-    """Raw GGUF Q5_0/Q8_0 blocks: gate rows, then up rows, then down rows."""
-    if block_bytes not in (22, 34) or gu.dtype != np.uint8 or dn.dtype != np.uint8 or gu.shape != (2 * FF, H // 32 * block_bytes) or dn.shape != (H, FF // 32 * block_bytes):
+    """Raw GGUF roles: matching Q5/Q8, or 110-byte Q3_K GU with Q2_0 down."""
+    if block_bytes == 110:
+        gu_row_bytes, dn_row_bytes = H // 256 * 110, FF // 64 * 18
+    elif block_bytes in (22, 34):
+        gu_row_bytes, dn_row_bytes = H // 32 * block_bytes, FF // 32 * block_bytes
+    else:
+        raise ValueError("Unsupported MTP native gate/up block size")
+    if gu.dtype != np.uint8 or dn.dtype != np.uint8 or gu.shape != (2 * FF, gu_row_bytes) or dn.shape != (H, dn_row_bytes):
         raise ValueError("MTP native experts need byte arrays with the original gate/up/down dimensions")
     return gu.tobytes() + dn.tobytes()
 
@@ -82,11 +89,16 @@ def main() -> int:
     formats = {gguf.GGMLQuantizationType.Q2_0: ("canonical-q2_0", 64, 18),
                gguf.GGMLQuantizationType.Q5_0: ("native-q5_0", 32, 22),
                gguf.GGMLQuantizationType.Q8_0: ("native-q8_0", 32, 34)}
-    if gu_tensor.tensor_type not in formats or dn_tensor.tensor_type != gu_tensor.tensor_type:
-        raise ValueError("MTP runtime supports matching Q2_0, Q5_0 or Q8_0 expert tensors")
-    expert_kind, block, block_bytes = formats[gu_tensor.tensor_type]
-    native = block == 32
-    gu_bytes, dn_bytes = H // block * block_bytes, FF // block * block_bytes
+    if gu_tensor.tensor_type == gguf.GGMLQuantizationType.Q3_K and dn_tensor.tensor_type == gguf.GGMLQuantizationType.Q2_0:
+        expert_kind, native = "native-q3_k-q2_0", True
+        block_bytes = 110
+        gu_bytes, dn_bytes = H // 256 * 110, FF // 64 * 18
+    else:
+        if gu_tensor.tensor_type not in formats or dn_tensor.tensor_type != gu_tensor.tensor_type:
+            raise ValueError("MTP runtime supports matching Q2_0/Q5_0/Q8_0, or Q3_K gate/up with Q2_0 down")
+        expert_kind, block, block_bytes = formats[gu_tensor.tensor_type]
+        native = block == 32
+        gu_bytes, dn_bytes = H // block * block_bytes, FF // block * block_bytes
     if gu.shape != (NE, 2 * FF, gu_bytes) or dn.shape != (NE, H, dn_bytes):
         raise ValueError(f"Incompatible expert shapes: {gu.shape}, {dn.shape}")
     with open(out / "experts.bin", "wb") as f:

@@ -155,7 +155,8 @@ private:
     uint8_t* dense_ = nullptr;
     uint8_t* experts_ = nullptr;
     uint64_t expert_blob_ = 0;
-    int native_expert_type_ = 0;
+    int native_gu_type_ = 0;
+    int native_d_type_ = 0;
     void* state_arena_ = nullptr;
     QsaState st_;
     void* arena_ = nullptr;

@@ -217,16 +217,27 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     std::ifstream expert_manifest(rt_dir + "/experts.txt");
     if (expert_manifest && !strata::artifact::parse_mtp_expert_manifest(
             expert_manifest, g.n_embd, g.n_ff, g.n_expert, expert_kind, err)) return false;
-    native_expert_type_ = expert_kind == strata::artifact::MtpExpertKind::NativeQ8 ? 8
-                        : expert_kind == strata::artifact::MtpExpertKind::NativeQ5 ? 6 : 0;
-    if (native_expert_type_ && !strata::kernels::native_expert_supported(
-            native_expert_type_, native_expert_type_, g.n_embd, g.n_ff)) {
+    native_gu_type_ = expert_kind == strata::artifact::MtpExpertKind::NativeQ8 ? 8
+                    : expert_kind == strata::artifact::MtpExpertKind::NativeQ5 ? 6
+                    : expert_kind == strata::artifact::MtpExpertKind::NativeQ3KQ2 ? 11 : 0;
+    native_d_type_ = expert_kind == strata::artifact::MtpExpertKind::NativeQ3KQ2 ? 42 : native_gu_type_;
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(__HIPCC__)
+    if (expert_kind == strata::artifact::MtpExpertKind::NativeQ3KQ2) {
+        err = "mtp: mixed Q3_K/Q2_0 draft is a CUDA experiment";
+        return false;
+    }
+#endif
+    if (native_gu_type_ && !strata::kernels::native_expert_supported(
+            native_gu_type_, native_d_type_, g.n_embd, g.n_ff)) {
         err = "mtp: native expert geometry is unsupported";
         return false;
     }
-    expert_blob_ = native_expert_type_
-        ? strata::kernels::native_expert_layout(native_expert_type_, native_expert_type_, g.n_embd, g.n_ff).bytes
+    expert_blob_ = native_gu_type_
+        ? strata::kernels::native_expert_layout(native_gu_type_, native_d_type_, g.n_embd, g.n_ff).bytes
         : strata::kernels::cpu::BLOB;
+    if (expert_kind == strata::artifact::MtpExpertKind::NativeQ3KQ2)
+        std::fprintf(stderr, "[mtp-mixed-q3] gu_type=11 down_type=42 blob_bytes=%llu active=1\n",
+            (unsigned long long) expert_blob_);
     // Loader fix (0.1.15+loaderfix.2): the two reads below are the whole “drafter files” cost; reporting
     // them apart from the rest of the stage is what makes the next regression visible.
     const auto t_files = std::chrono::steady_clock::now();
@@ -354,9 +365,9 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
         grp_ptr_ = b.take<unsigned long long>(T * K); grp_start_ = b.take<int32_t>(T * K + 1);
         grp_counts_ = b.take<int32_t>(4);
-        hit_xq_ = b.take<uint8_t>(T * (N / 32) * (native_expert_type_ ? 36 : 34));
+        hit_xq_ = b.take<uint8_t>(T * (N / 32) * (native_gu_type_ ? 36 : 34));
         hit_xs_ = b.take<float>(T * (N / 32));
-        hit_scratch_ = b.take<uint8_t>(native_expert_type_
+        hit_scratch_ = b.take<uint8_t>(native_gu_type_
             ? strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)
             : strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff));
         sh_scratch_ = (float*) b.take<uint8_t>(strata::kernels::shared_expert_scratch_bytes(g.n_ff));
@@ -726,8 +737,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         }
         moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) expert_blob_, grp_ptr_,
                             grp_start_, grp_counts_, hit_dst_, hit_slot_, cs);
-        if (native_expert_type_) {
-            const auto layout = native_expert_layout(native_expert_type_, native_expert_type_, N, g.n_ff);
+        if (native_gu_type_) {
+            const auto layout = native_expert_layout(native_gu_type_, native_d_type_, N, g.n_ff);
             native_quantize_q8_1(mixed_, hit_xq_, (int) N, T, cs);
             native_expert_grouped(layout, grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_,
                                   (int64_t) T * K, (int64_t) T * K, hit_xq_, hit_scratch_, parts_, cs);

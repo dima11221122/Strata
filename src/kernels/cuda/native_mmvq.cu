@@ -27,6 +27,7 @@
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/q3_q8_dot.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -370,45 +371,8 @@ __device__ __forceinline__ int load_int_b2(const void* ptr, int i32) {
     return value;
 }
 
-__device__ __forceinline__ float q3_q8_dot_impl(int vl, int vh, const int* __restrict__ u,
-                                              const uint8_t* __restrict__ scales,
-                                              int scale_offset, float d3,
-                                              const float* __restrict__ d8) {
-    float sumf = 0.0f;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const int isc = scale_offset + 2 * i;
-        const int isc_low = isc % 8;
-        const int sc_shift_low = 4 * (isc / 8);
-        const int sc_low = (scales[isc_low] >> sc_shift_low) & 0xf;
-        const int isc_high = isc % 4;
-        const int sc_shift_high = 2 * (isc / 4);
-        const int sc_high = ((scales[8 + isc_high] >> sc_shift_high) & 3) << 4;
-        const int sc = (sc_low | sc_high) - 32;
-        const int vil = (vl >> (2 * i)) & 0x03030303;
-        const int vih = ((vh >> i) << 2) & 0x04040404;
-        const int vi = __vsubss4(vil, vih);
-        sumf += d8[i] * (STRATA_DP4A(vi, u[i], 0) * sc);
-    }
-    return d3 * sumf;
-}
-
-__device__ __forceinline__ float q3_q8_dot(const Q3KBlock* __restrict__ w,
-                                          const Q81Block* __restrict__ x, int iqs) {
-    const int bq8_offset = 4 * (iqs / 8);
-    const int scale_offset = iqs - iqs % 8 + (iqs % 8) / 4;
-    const float d = w->d;
-    const int vl = load_int_b2(w->qs, iqs);
-    const int vh = ~load_int_b2(w->hmask, iqs % 8) >> bq8_offset;
-    int u[4];
-    float d8[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        u[i] = reinterpret_cast<const int*>(x[bq8_offset + i].qs)[iqs % 8];
-        d8[i] = __low2float(x[bq8_offset + i].ds);
-    }
-    return q3_q8_dot_impl(vl, vh, u, w->scales, scale_offset, d, d8);
-}
+using detail::q3_q8_dot;
+using detail::q3_q8_dot_impl;
 
 // Q3_K generic MMVQ: QK=256, QI=16, VDR=1, eight blocks per iteration.
 template<bool SmallK>

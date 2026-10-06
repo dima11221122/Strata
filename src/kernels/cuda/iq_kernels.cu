@@ -7,6 +7,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
+#include "strata/kernels/q3_q8_dot.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -491,6 +492,10 @@ __device__ __forceinline__ float vec_dot_q8_0_q8_1(const void* __restrict__ vbq,
 // ---------------------------------------------------------------- the formats
 // qk = values per block, ipb = dot calls per block (qi / vdr), step = the iqs stride between calls.
 template<int TY> struct Fmt;
+template<> struct Fmt<11> { static constexpr int qk = 256, ipb = 16, step = 1;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) {
+        return detail::q3_q8_dot(static_cast<const block_q3_K*>(v) + kbx, y, iqs);
+    } };
 template<> struct Fmt<16> { static constexpr int qk = 256, ipb = 8, step = 2;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq2_xxs_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<17> { static constexpr int qk = 256, ipb = 8, step = 2;
@@ -522,7 +527,7 @@ template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0,
 
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
-#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(8)
+#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(8) X(11)
 #define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(8)
 #define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(8)
 
