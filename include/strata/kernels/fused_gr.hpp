@@ -44,7 +44,9 @@ void fused_gr_read(const FusedGrArgs& a, void* stream);
 /// Plan v0.3 P6: the same read for up to 8 tokens that share the weights (a verify window): the weights are read
 /// once for all of them.  `a[t]` is token t's arguments (its own R, pending write, lo, rs, inject, mixed; the four
 /// weight pointers and eps must be the same for every t); `xn_scratch` is n_tok * hc * n_embd floats.  Every
-/// token's outputs are bitwise `fused_gr_read(a[t])`.
+/// token's outputs are bitwise `fused_gr_read(a[t])` on the default path. Opt-in STRATA_GR_V3/STRATA_GR_SPLIT
+/// reorder sums. STRATA_GR_UP_TF32 approximates the up projection with two TF32 activation components for
+/// widths 2..4 on a supported CUDA kernel; other widths keep the original up projection.
 constexpr int kFusedGrMaxT = 8;
 void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
                          unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);
@@ -60,7 +62,7 @@ void fused_gr_set_fast(int on);
 /// (1..8 tokens, with and without the pending write) and from then on uses there the newest one that agrees with the
 /// plain read bit for bit; STRATA_HC_SPLIT=0 keeps the plain read, =1 stops at split.  It runs once per card
 /// (Verifier::init calls it) and prints which one runs.  On a card it has not checked, `fused_gr_variant` is the
-/// plain read unless STRATA_HC_SPLIT=1 or 2 names a variant.
+/// plain read unless STRATA_HC_SPLIT=1 or 2 names a variant. Arithmetic opt-ins are excluded from this check.
 void fused_gr_check();
 int fused_gr_variant();
 

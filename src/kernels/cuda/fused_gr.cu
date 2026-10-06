@@ -3,6 +3,7 @@
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "tf32_mma.cuh"
 
 #include <cuda_runtime.h>
 
@@ -253,6 +254,30 @@ __global__ void __launch_bounds__(THREADS) gr_down_multi_kernel(GrMulti m) {
 constexpr int UPM_COLS = 16;                      // columns per block (x 4 streams = 64 rows, 8 per warp)
 constexpr int UPM_BLOCKS = N / UPM_COLS;          // 160
 
+struct GrUpInputs {
+    float rv = 0.0f, wn = 0.0f, rs = 0.0f, bo = 0.0f, ip = 0.0f;
+    bool apply = false;
+};
+
+__device__ __forceinline__ GrUpInputs gr_up_inputs(const FusedGrArgs& a, int i, int d, int c) {
+    GrUpInputs v;
+    v.rv = a.R[i];
+    v.wn = a.w_norm[i];
+    v.rs = a.rs[c];
+    v.apply = a.apply;
+    if (v.apply) { v.bo = a.bo_prev[d]; v.ip = a.inj_prev[c]; }
+    return v;
+}
+
+__device__ __forceinline__ float gr_up_finish(const FusedGrArgs& a, int i, GrUpInputs v, float dot) {
+    if (v.apply) {
+        v.rv = fmaf(v.bo, 2.0f * sigmoidf_(v.ip / (float) HC), v.rv);
+        a.R_out[i] = v.rv;
+    }
+    const float x = v.rv * v.wn * v.rs;
+    return x * sigmoidf_(dot);
+}
+
 // `gr_up_kernel` for T tokens: each row of w_up read once; the T dots reduced by xor so every lane holds every
 // sum, and lane k runs token k's epilogue - the T epilogues in parallel instead of one after another.
 __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
@@ -269,16 +294,8 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
         const uint4 wa = __ldg(w4 + lane);
         const uint4 wb = lane < LR / 8 - 32 ? __ldg(w4 + 32 + lane) : make_uint4(0, 0, 0, 0);
         // the epilogue inputs of this lane's token, fetched while the dots run
-        float rv = 0.0f, wn = 0.0f, rsc = 0.0f, bo = 0.0f, ip = 0.0f;
-        bool apply = false;
-        if (lane < T) {
-            const FusedGrArgs& a = m.a[lane];
-            rv = a.R[i];
-            wn = a.w_norm[i];
-            rsc = a.rs[c];
-            apply = a.apply;
-            if (apply) { bo = a.bo_prev[d0 + dd]; ip = a.inj_prev[c]; }
-        }
+        GrUpInputs inputs;
+        if (lane < T) inputs = gr_up_inputs(m.a[lane], i, d0 + dd, c);
         float mine = 0.0f;
 #pragma unroll
         for (int k = 0; k < kFusedGrMaxT; ++k) {
@@ -289,12 +306,7 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
             if (lane == k) mine = acc;
         }
         if (lane < T) {
-            if (apply) {
-                rv = fmaf(bo, 2.0f * sigmoidf_(ip / (float) HC), rv);
-                m.a[lane].R_out[i] = rv;
-            }
-            const float x = rv * wn * rsc;
-            g[lane][c][dd] = x * sigmoidf_(mine);
+            g[lane][c][dd] = gr_up_finish(m.a[lane], i, inputs, mine);
         }
     }
     __syncthreads();
@@ -305,6 +317,95 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
         for (int c = 0; c < HC; ++c) s += g[k][c][col];
         m.a[k].mixed[d0 + col] = s / (float) HC;
     }
+}
+
+// Widths 2..4 use a tile's spare four columns for the rounded activation residual.
+// BF16 weights are exactly representable in TF32. Inputs and accumulation remain
+// approximate: this opt-in is deliberately outside the bitwise HC startup check.
+__global__ void __launch_bounds__(128) gr_up_tf32_kernel(GrMulti m) {
+#if !defined(__HIPCC__) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
+    __shared__ uint32_t lo[8][LR + 4];  // each token column starts on different shared-memory banks
+    __shared__ float g[4][HC][UPM_COLS];
+    const int t = threadIdx.x, lane = t & 31, c = t >> 5;
+    const int gid = lane >> 2, tig = lane & 3;
+    const int T = m.T, d0 = blockIdx.x * UPM_COLS;
+    for (int i = t; i < 4 * LR; i += 128) {
+        const int k = i / LR, r = i % LR;
+        const float x = k < T ? m.a[k].lo[r] : 0.0f;
+        const uint32_t hi = detail::tf32_hi(x);
+        lo[k][r] = hi;
+        lo[k + 4][r] = detail::tf32_hi(x - __uint_as_float(hi));
+    }
+    __syncthreads();
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const uint16_t* w = m.a[0].w_up + (size_t) (c * N + d0 + gid) * LR;
+#pragma unroll 4
+    for (int k0 = 0; k0 < LR; k0 += 8) {
+        const uint32_t a[4] = {
+            (uint32_t) __ldg(w + k0 + tig) << 16,
+            (uint32_t) __ldg(w + 8 * LR + k0 + tig) << 16,
+            (uint32_t) __ldg(w + k0 + tig + 4) << 16,
+            (uint32_t) __ldg(w + 8 * LR + k0 + tig + 4) << 16};
+        const uint32_t b[2] = {lo[gid][k0 + tig], lo[gid][k0 + tig + 4]};
+        detail::mma_tf32(acc, a, b);
+    }
+    // C rows are gid/gid+8, columns 2*tig/2*tig+1. Lane xor2
+    // supplies the corresponding residual column; every lane executes the shuffle.
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int v = half * 2 + j;
+            const float correction = __shfl_xor_sync(0xffffffffu, acc[v], 2);
+            const int k = 2 * tig + j;
+            if (k < T) {
+                const int dd = gid + half * 8, i = c * N + d0 + dd;
+                const GrUpInputs inputs = gr_up_inputs(m.a[k], i, d0 + dd, c);
+                g[k][c][dd] = gr_up_finish(m.a[k], i, inputs, __fadd_rn(acc[v], correction));
+            }
+        }
+    }
+    __syncthreads();
+    for (int i = t; i < T * UPM_COLS; i += 128) {
+        const int k = i / UPM_COLS, col = i % UPM_COLS;
+        float sum = 0.0f;
+#pragma unroll
+        for (int cc = 0; cc < HC; ++cc) sum += g[k][cc][col];
+        m.a[k].mixed[d0 + col] = sum / (float) HC;
+    }
+#else
+    __trap();
+#endif
+}
+
+bool gr_up_tf32_enabled() {
+#if defined(__HIPCC__)
+    return false;
+#else
+    static const bool requested = [] {
+        const char* v = std::getenv("STRATA_GR_UP_TF32");
+        return v && std::atoi(v) != 0;
+    }();
+    if (!requested) return false;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    static std::atomic<int> supported[64];
+    int result = supported[dev].load();
+    if (result == 0) {
+        int major = 0;
+        cudaFuncAttributes attributes{};
+        const bool queried = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess;
+        const bool loaded = cudaFuncGetAttributes(&attributes, gr_up_tf32_kernel) == cudaSuccess;
+        result = queried && strata::cc_major_of(major) >= 8 && loaded && attributes.ptxVersion >= 80 &&
+                 attributes.binaryVersion >= 80 ? 2 : 1;
+        int expected = 0;
+        if (supported[dev].compare_exchange_strong(expected, result)) {
+            std::fprintf(stderr, "[gr-up-tf32] device=%d active=%d widths=2..4 ptx_arch=%d binary_arch=%d\n",
+                         dev, result == 2, attributes.ptxVersion, attributes.binaryVersion);
+        }
+    }
+    return result == 2;
+#endif
 }
 
 
@@ -764,7 +865,8 @@ __global__ void __launch_bounds__(THREADS) gr_up_fast_kernel(GrMulti m);
 static bool gr_fast();
 namespace {
 #endif
-void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0) {
+void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0,
+                  bool allow_tf32_up = false) {
     const int n_tok = m.T;
 #if defined(STRATA_HIP_GFX906)
     // gfx906: the latency-hidden norm/up (STRATA_GR_FAST=0: off) - the same sums in the same order as the kernels
@@ -814,7 +916,9 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
     if (fast) gr_up_fast_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
     else
 #endif
-    gr_up_multi_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+    if (allow_tf32_up && n_tok >= 2 && n_tok <= 4 && gr_up_tf32_enabled())
+        gr_up_tf32_kernel<<<UPM_BLOCKS, 128, 0, st>>>(m);
+    else gr_up_multi_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
 }
 
 /// STRATA_HC_SPLIT: unset or 2 = the newest the check accepts (staged), 1 = at most split, 0 = the plain read
@@ -1155,7 +1259,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     }
 #endif
     // the default read (STRATA_GR_V3 unset): v1, or the bitwise-equal v2 / v3 this card's check accepted
-    launch_multi(m, fused_gr_variant(), st, stamp_buf, stamp_i0);
+    launch_multi(m, fused_gr_variant(), st, stamp_buf, stamp_i0, true);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "fused_gr_read_multi: %s\n", cudaGetErrorString(e));
