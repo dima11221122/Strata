@@ -762,11 +762,12 @@ __global__ void q6_gather_canonical_kernel(const Q6KPredecodedBlock* __restrict_
 }
 
 // Q6_K generic MMVQ: QK=256, QI=32, VDR=1, four blocks per iteration.
-template<bool SmallK, typename Block = Q6KBlock>
+template<bool SmallK, typename Block = Q6KBlock, bool Indexed = false>
 __launch_bounds__(WARPS * WARP, 1)
 __global__ void native_q6_k_mmvq_kernel(const Block* __restrict__ w,
                                         const Q81Block* __restrict__ x,
-                                        float* __restrict__ y, int n_in, int n_out) {
+                                        float* __restrict__ y, int n_in, int n_out,
+                                        const int32_t* __restrict__ row_ids = nullptr) {
     constexpr int ROWS = SmallK ? WARPS : 1;
     constexpr int BLOCKS_PER_ITER = WARPS * WARP / 32;
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
@@ -779,7 +780,8 @@ __global__ void native_q6_k_mmvq_kernel(const Block* __restrict__ w,
 #pragma unroll
         for (int i = 0; i < ROWS; ++i) {
             if (row0 + i < n_out) {
-                const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
+                const int row = Indexed ? row_ids[row0 + i] : row0 + i;
+                const std::size_t block = std::size_t(row) * blocks_per_row + kbx;
                 tmp[i] += q6_q8_dot(w + block, x + kby, kqs);
             }
         }
@@ -1860,6 +1862,25 @@ void q6_mmvq_layout(const void* weights, const void* x_q8_1, float* y,
 void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream) {
     q6_mmvq_layout<Q6KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
+}
+
+void native_q6_k_indexed_mmvq(const void* weights, const int32_t* row_ids,
+                              const void* x_q8_1, float* y, int n_in, int n_out, void* stream) {
+    validate_shape(n_in, 1, QK);
+    if (n_out <= 0) throw std::invalid_argument("indexed Q6 head requires n_out > 0");
+    validate_pointer(weights); validate_pointer(row_ids); validate_pointer(x_q8_1);
+    validate_pointer(y); validate_stream(stream);
+    const auto* w = static_cast<const Q6KBlock*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const auto s = static_cast<cudaStream_t>(stream);
+    const dim3 threads(WARP, WARPS);
+    if (n_in / QK < WARPS * WARP / 32) {
+        const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+        native_q6_k_mmvq_kernel<true, Q6KBlock, true><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out, row_ids);
+    } else {
+        native_q6_k_mmvq_kernel<false, Q6KBlock, true><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out, row_ids);
+    }
+    launch_check();
 }
 
 std::size_t native_q6_k_predecoded_bytes(int n_in, int n_out) {

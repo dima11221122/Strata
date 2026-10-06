@@ -169,6 +169,7 @@ private:
     // the draft head: the main head's rows for a token subset (rt/draft_vocab.bin), or the whole head
     uint8_t* dhead_ = nullptr;
     bool dhead_aligned_ = false;   ///< internal 212-byte Q6 layout; original head/type stay canonical
+    bool dhead_indexed_ = false;   ///< reads the borrowed NativeHead; no owned subset weights
     int32_t* dvocab_ = nullptr;
     int64_t n_dvocab_ = 0;
     std::string rt_dir_;

@@ -41,6 +41,7 @@
 #include <exception>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 #include <vector>
 #if defined(_WIN32)
 #include <intrin.h>
@@ -74,6 +75,18 @@ bool aligned_draft_head() {
 #else
     static const bool enabled = [] {
         const char* value = std::getenv("STRATA_MTP_Q6_ALIGNED");
+        return value && std::atoi(value) != 0;
+    }();
+    return enabled;
+#endif
+}
+
+bool indexed_draft_head() {
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(__HIPCC__)
+    return false;
+#else
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_MTP_Q6_INDEXED");
         return value && std::atoi(value) != 0;
     }();
     return enabled;
@@ -385,7 +398,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
 
 uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const {
     uint64_t bytes = head_logits_ ? 0 : (uint64_t) max_t_ * (uint64_t) n_vocab * sizeof(float);
-    if (dhead_ == nullptr) {
+    if (dvocab_ == nullptr) {
         if (FILE* f = std::fopen((rt_dir_ + "/draft_vocab.bin").c_str(), "rb")) {
             std::fseek(f, 0, SEEK_END);
             const long size = std::ftell(f);
@@ -394,7 +407,9 @@ uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const 
                 // Among supported formats, this row size identifies Q6_K for the same input dimension.
                 if (aligned_draft_head() && g_ && head_row_bytes == (uint64_t) (g_->n_embd / 256) * 210)
                     head_row_bytes = strata::kernels::native_q6_k_aligned_bytes((int) g_->n_embd, 1);
-                bytes += (uint64_t) (size / 4) * head_row_bytes + (uint64_t) size;
+                const bool indexed = indexed_draft_head() && g_ && g_->n_embd % 256 == 0 &&
+                    head_row_bytes == (uint64_t) (g_->n_embd / 256) * 210;
+                bytes += (indexed ? 0 : (uint64_t) (size / 4) * head_row_bytes) + (uint64_t) size;
             }
         }
     }
@@ -406,7 +421,7 @@ uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const 
 }
 
 bool MtpDrafter::setup_coupled(std::string& err) {
-    const int64_t nv = dhead_ != nullptr ? n_dvocab_ : n_vocab_;
+    const int64_t nv = dvocab_ != nullptr ? n_dvocab_ : n_vocab_;
     const size_t scratch = strata::kernels::coupled_draft_scratch_bytes((int) nv);
     if (scratch == 0) {
         std::fprintf(stderr, "strata mtp: STRATA_SPEC_COUPLED: %lld draft logits are too wide for the coupled sampler; "
@@ -424,7 +439,7 @@ bool MtpDrafter::setup_coupled(std::string& err) {
     cudaMemset(cring_, 0xff, ring);   // -1: no token
     std::fill(h_chist_, h_chist_ + kCoupledHistCap, -1);
     vram_ += sizeof(strata::kernels::SamplerParams) + ring + scratch;
-    if (dhead_ != nullptr) {   // token id -> subset index (-1: not in the draft head), for the penalties
+    if (dvocab_ != nullptr) {   // token id -> subset index (-1: not in the draft head), for the penalties
         std::vector<int32_t> sub((size_t) n_dvocab_), inv((size_t) n_vocab_, -1);
         cudaMemcpy(sub.data(), dvocab_, sub.size() * sizeof(int32_t), cudaMemcpyDeviceToHost);
         for (size_t i = 0; i < sub.size(); ++i)
@@ -507,13 +522,20 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
     if (!wo) { err = "mtp: output.weight is missing"; return false; }
     n_vocab_ = wo->ne1;
     if (head == nullptr || !head->loaded()) { err = "mtp: the draft layer needs the native head (--native)"; return false; }
+    const bool indexed = indexed_draft_head();
+    const char* single = std::getenv("STRATA_Q6_ROW_WARP_SINGLE");
+    if (indexed && (head->type() != 14 || head->q6_predecoded() || aligned_draft_head() ||
+                    (single && std::atoi(single) != 0) || g_->n_embd % 256 != 0)) {
+        err = "mtp: indexed head requires canonical Q6 and the generic single-column layout";
+        return false;
+    }
     if (head_logits_ == nullptr &&
         cudaMalloc((void**) &head_logits_, (size_t) max_t_ * (size_t) n_vocab_ * sizeof(float)) != cudaSuccess) {
         err = "mtp: the draft logits do not fit";
         return false;
     }
     // the draft head's token subset, when tools/draft_vocab.py wrote one
-    if (dhead_ == nullptr) {
+    if (dvocab_ == nullptr) {
         std::vector<uint8_t> raw;
         if (read_file(rt_dir_ + "/draft_vocab.bin", raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
             n_dvocab_ = (int64_t) (raw.size() / 4);
@@ -522,7 +544,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             const bool predecoded = head->q6_predecoded();
             if (aligned && predecoded) { err = "mtp: aligned and predecoded head probes cannot be combined"; return false; }
             uint64_t head_bytes = (uint64_t) (n_dvocab_ * row_bytes);
-            if (aligned || predecoded) {
+            if (aligned || predecoded || indexed) {
                 const char* single = std::getenv("STRATA_Q6_ROW_WARP_SINGLE");
                 if (n_dvocab_ > INT_MAX || (single && std::atoi(single) != 0)) {
                     err = "mtp: Q6 head gather requires int32 rows and the generic draft single-column layout";
@@ -536,12 +558,12 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 if (aligned) head_bytes = strata::kernels::native_q6_k_aligned_bytes((int) g_->n_embd, (int) n_dvocab_);
             }
             if (cudaMalloc((void**) &dvocab_, raw.size()) != cudaSuccess ||
-                cudaMalloc((void**) &dhead_, head_bytes) != cudaSuccess) {
+                (!indexed && cudaMalloc((void**) &dhead_, head_bytes) != cudaSuccess)) {
                 err = "mtp: the draft head does not fit";
                 draft_head_hint(n_dvocab_, row_bytes);
                 return false;
             }
-            if (aligned || predecoded) {
+            if (aligned || predecoded || indexed) {
                 if (cudaMemcpyAsync(dvocab_, raw.data(), raw.size(), cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
                     cudaStreamSynchronize(cs_);
                     err = "mtp: Q6 vocabulary upload failed"; return false;
@@ -550,7 +572,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                     if (predecoded)
                         strata::kernels::native_q6_k_gather_canonical(head->weights(), dvocab_, dhead_,
                             (int) g_->n_embd, (int) n_dvocab_, cs_);
-                    else
+                    else if (aligned)
                         strata::kernels::native_q6_k_gather_aligned(head->weights(), dvocab_, dhead_,
                             (int) g_->n_embd, (int) n_dvocab_, cs_);
                 } catch (const std::exception& e) {
@@ -559,8 +581,16 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 }
                 if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: Q6 head gather failed"; return false; }
                 dhead_aligned_ = aligned;
+                // NativeHead owns the indexed source; MTP owns only its vocabulary.
+                dhead_indexed_ = indexed;
+                if (indexed) {
+                    std::fprintf(stderr, "[mtp-q6-indexed] active=1 rows=%lld saved_bytes=%llu\n",
+                        (long long) n_dvocab_, (unsigned long long) head_bytes);
+                    head_bytes = 0;
+                }
                 std::fprintf(stderr, "[%s] block_bytes=%d rows=%lld bytes=%llu\n",
-                    predecoded ? "mtp-q6-canonical" : "mtp-q6-aligned", predecoded ? 210 : 212,
+                    indexed ? "mtp-q6-indexed" : predecoded ? "mtp-q6-canonical" : "mtp-q6-aligned",
+                    indexed || predecoded ? 210 : 212,
                     (long long) n_dvocab_, (unsigned long long) head_bytes);
             } else {
                 cudaMemcpy(dvocab_, raw.data(), raw.size(), cudaMemcpyHostToDevice);
@@ -751,9 +781,12 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                         sample_ + t * N, dummy_inj_, cs);
         }
         native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
-        const bool sub = dhead_ != nullptr;
+        const bool sub = dvocab_ != nullptr;
         const int64_t nv = sub ? n_dvocab_ : n_vocab_;
-        if (dhead_aligned_) native_q6_k_aligned_mmvq(dhead_, xq_, head_logits_, (int) N, (int) nv, cs);
+        if (dhead_indexed_) {
+            if (T != 1) throw std::invalid_argument("indexed Q6 draft head requires one activation column");
+            native_q6_k_indexed_mmvq(head_->weights(), dvocab_, xq_, head_logits_, (int) N, (int) nv, cs);
+        } else if (dhead_aligned_) native_q6_k_aligned_mmvq(dhead_, xq_, head_logits_, (int) N, (int) nv, cs);
         else if (sub) native_mmvq(head_->type(), dhead_, xq_, head_logits_, (int) N, (int) nv, T, cs);
         else head_->project_q8(xq_, head_logits_, T, cs);
         if (coupled_rec_) {

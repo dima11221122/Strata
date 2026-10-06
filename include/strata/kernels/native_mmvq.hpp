@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace strata::kernels {
 
@@ -84,6 +85,12 @@ void native_q4_k_f32(const void* weights, const float* x, void* scratch_q8_1,
 
 void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream);
+
+// Canonical Q6 single-column head with validated source row IDs. Logits stay in
+// subset order; the original generic dot and reduction are unchanged. The caller
+// retains the source head and row IDs through every captured graph launch.
+void native_q6_k_indexed_mmvq(const void* weights, const int32_t* row_ids,
+                              const void* x_q8_1, float* y, int n_in, int n_out, void* stream);
 
 // Internal CUDA draft-head probe: original Q6 bits/scales with two padding bytes per
 // block. Gather validated vocabulary row IDs directly from the original head;
