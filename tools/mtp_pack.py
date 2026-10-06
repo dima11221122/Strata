@@ -5,6 +5,9 @@ no longer on this PC, so Strata packs its own from the 31 `mtp.*` tensors fetche
 
     python tools/mtp_pack.py --src Desktop/Strata/mtp-bf16 --experts q2_0 --out mtp-q2_0.gguf
     python tools/mtp_pack.py --src ... --experts q4_0 --out mtp-q4_0.gguf       (acceptance comparison arm)
+    python tools/mtp_pack.py --src ... --experts q2_0 --q2-signed-gu --out mtp-q2-signed-gu.gguf
+
+--q2-signed-gu is an experimental, default-off draft gate/up scale search; down and dense encoding stay canonical.
 
 Layout: dense tensors (attention, indexer, hyper-connections, shared expert, router, fc/norms) stay BF16 (F32 for
 1-D norms), ~0.18 GB. The routed experts keep the checkpoint's fused layout - `gate_up_proj` [512, 1280, 2560] and
@@ -56,7 +59,7 @@ def load_bf16(path: Path, shape: list[int]) -> np.ndarray:
 
 
 # ------------------------------------------------------------------------------------------------ quantizers
-def q2_0(w: np.ndarray) -> np.ndarray:
+def q2_0(w: np.ndarray, allow_signed: bool = False) -> np.ndarray:
     """[..., n] float32 -> bytes of Q2_0 blocks (fp16 d, 16 bytes of 2-bit codes, code = q + 1, 4 per byte)."""
     x = w.reshape(-1, 64).astype(np.float32)
     amax = np.abs(x).max(axis=1, keepdims=True)
@@ -71,9 +74,24 @@ def q2_0(w: np.ndarray) -> np.ndarray:
         better = err < best_err
         best_err = np.where(better, err, best_err)
         best_d = np.where(better, d, best_d)
+    if allow_signed:
+        # Keep the canonical positive winner, then compare mirrored grids using
+        # their stored FP16 scales. Negative d gives {-2, -1, 0, 1} at no byte cost.
+        d = best_d.astype(np.float16).astype(np.float32)
+        inv = np.where(d != 0, 1.0 / np.where(d != 0, d, 1.0), 0.0)
+        q = np.clip(np.rint(x * inv), -1, 2)
+        best_err = ((q * d - x) ** 2).sum(axis=1, keepdims=True)
+        for f in np.linspace(0.5, 1.0, 17, dtype=np.float32):
+            d = (-amax * f).astype(np.float16).astype(np.float32)
+            inv = np.where(d != 0, 1.0 / np.where(d != 0, d, 1.0), 0.0)
+            q = np.clip(np.rint(x * inv), -1, 2)
+            err = ((q * d - x) ** 2).sum(axis=1, keepdims=True)
+            better = err < best_err
+            best_err = np.where(better, err, best_err)
+            best_d = np.where(better, d, best_d)
     d16 = best_d.astype(np.float16)
     d = d16.astype(np.float32)                                   # quantize against the STORED scale
-    inv = np.where(d > 0, 1.0 / np.where(d > 0, d, 1.0), 0.0)
+    inv = np.where(d != 0, 1.0 / np.where(d != 0, d, 1.0), 0.0)
     codes = (np.clip(np.rint(x * inv), -1, 2) + 1).astype(np.uint8)          # 0..3
     c = codes.reshape(-1, 16, 4)
     packed = (c[:, :, 0] | (c[:, :, 1] << 2) | (c[:, :, 2] << 4) | (c[:, :, 3] << 6)).astype(np.uint8)
@@ -147,8 +165,11 @@ def main() -> int:
     ap.add_argument("--src", required=True, help="directory written by tools/mtp_fetch.py fetch")
     ap.add_argument("--experts", choices=sorted(QUANT), default="q2_0")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--q2-signed-gu", action="store_true", help="allow signed Q2_0 scales for draft gate/up only")
     ap.add_argument("--check-experts", type=int, default=8, help="experts per tensor used for the error report")
     a = ap.parse_args()
+    if a.q2_signed_gu and a.experts != "q2_0":
+        ap.error("--q2-signed-gu requires --experts q2_0")
     src = Path(a.src)
     manifest = json.loads((src / "mtp-manifest.json").read_text())
     fn, qtype, block, block_bytes = QUANT[a.experts]
@@ -157,7 +178,8 @@ def main() -> int:
     w.add_string("strata.mtp.source_sha256", hashlib.sha256(
         json.dumps({t["name"]: t["sha256"] for t in manifest}, sort_keys=True).encode()).hexdigest())
     w.add_string("strata.mtp.expert_format", a.experts)
-    w.add_string("strata.mtp.expert_quantizer", "per-block MSE scale search" if a.experts == "q2_0" else "ggml reference")
+    w.add_string("strata.mtp.expert_quantizer", "signed GU per-block MSE scale search" if a.q2_signed_gu else
+                 "per-block MSE scale search" if a.experts == "q2_0" else "ggml reference")
     report = []
     for t in sorted(manifest, key=lambda t: t["name"]):
         name, shape = t["name"], t["shape"]
@@ -169,7 +191,8 @@ def main() -> int:
             x = _Experts(raw)
             if shape[-1] % block:
                 raise ValueError(f"{name}: inner dim {shape[-1]} not a multiple of {block}")
-            parts = [fn(x[e]) for e in range(shape[0])]            # one expert at a time bounds memory
+            quant = (lambda values: q2_0(values, allow_signed=True)) if a.q2_signed_gu and name == EXPERT_TENSORS[0] else fn
+            parts = [quant(x[e]) for e in range(shape[0])]         # one expert at a time bounds memory
             blob = np.concatenate(parts)
             errs = []
             for e in range(min(a.check_experts, shape[0])):
