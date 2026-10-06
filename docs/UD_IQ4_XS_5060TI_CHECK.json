@@ -1,0 +1,300 @@
+{
+  "checkedAt": "2026-10-06T07:12:40.657Z",
+  "model": "Qwen3.8-Flash-Next-UD-IQ4_XS",
+  "modelRevision": "38bb39ee97821de2c9009abb7e93950eec396e66",
+  "engine": {
+    "version": "0.1.39",
+    "sha256": "3378aa4130f6a3fa4e5ff446f5c43809f9d434b0fed33fb652a41103b625c3a7"
+  },
+  "hardware": {
+    "gpu": "RTX 5060 Ti 16 GB",
+    "cpu": "EPYC 7K62",
+    "driver": "580.178.04",
+    "kernel": "6.8.0-138-generic"
+  },
+  "setup": {
+    "capacity": 131072,
+    "mtp": true,
+    "mtpExpertFormat": "Q2_0",
+    "mtpExpertMiB": 675,
+    "draftVocabularyRows": 40525,
+    "draftCap": 4,
+    "confidence": 0.7,
+    "workers": 20,
+    "pcieFraction": 0.2,
+    "kv": "int8",
+    "kvResidentCells": 32768,
+    "expertCache": "auto",
+    "actualGpuSlots": 3451,
+    "actualGpuCacheGiB": 7.77,
+    "actualPinnedExpertRamGiB": 47.67,
+    "residentBudgetGiB": 56,
+    "vramReserveMiB": 1024,
+    "environment": {
+      "STRATA_Q6_ROW_WARP": "1",
+      "STRATA_VERIFY_FETCH_OVERLAP": "1"
+    }
+  },
+  "benchmark": {
+    "source": "local laptop through SSH tunnel",
+    "prompts": [
+      "Python LRU cache",
+      "database crash recovery",
+      "TypeScript task queue"
+    ],
+    "outputsPerPrompt": 512,
+    "runs": [
+      {
+        "started": "2026-10-06T07:06:33.439Z",
+        "completed": "2026-10-06T07:07:13.961Z",
+        "rates": [
+          42.4,
+          39.5,
+          42.2
+        ],
+        "median": 42.2,
+        "results": [
+          {
+            "prompt": 1,
+            "usage": {
+              "prompt_tokens": 50,
+              "completion_tokens": 512,
+              "total_tokens": 562,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "timings": {
+              "cache_n": 0,
+              "prompt_n": 50,
+              "prompt_ms": 814.7,
+              "prompt_per_token_ms": 16.294,
+              "prompt_per_second": 61.4,
+              "predicted_n": 512,
+              "predicted_ms": 12076.2,
+              "predicted_per_token_ms": 23.586,
+              "predicted_per_second": 42.4,
+              "draft_n": 359,
+              "draft_n_accepted": 296
+            },
+            "wallSeconds": 13.15
+          },
+          {
+            "prompt": 2,
+            "usage": {
+              "prompt_tokens": 52,
+              "completion_tokens": 512,
+              "total_tokens": 564,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "timings": {
+              "cache_n": 0,
+              "prompt_n": 52,
+              "prompt_ms": 866.3,
+              "prompt_per_token_ms": 16.66,
+              "prompt_per_second": 60,
+              "predicted_n": 512,
+              "predicted_ms": 12966.7,
+              "predicted_per_token_ms": 25.326,
+              "predicted_per_second": 39.5,
+              "draft_n": 351,
+              "draft_n_accepted": 279
+            },
+            "wallSeconds": 14.073
+          },
+          {
+            "prompt": 3,
+            "usage": {
+              "prompt_tokens": 50,
+              "completion_tokens": 512,
+              "total_tokens": 562,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "timings": {
+              "cache_n": 0,
+              "prompt_n": 50,
+              "prompt_ms": 888.7,
+              "prompt_per_token_ms": 17.774,
+              "prompt_per_second": 56.3,
+              "predicted_n": 512,
+              "predicted_ms": 12145.4,
+              "predicted_per_token_ms": 23.721,
+              "predicted_per_second": 42.2,
+              "draft_n": 351,
+              "draft_n_accepted": 287
+            },
+            "wallSeconds": 13.298
+          }
+        ]
+      },
+      {
+        "started": "2026-10-06T07:08:11.950Z",
+        "completed": "2026-10-06T07:08:52.201Z",
+        "rates": [
+          37.9,
+          38,
+          51.6
+        ],
+        "median": 38,
+        "results": [
+          {
+            "prompt": 1,
+            "usage": {
+              "prompt_tokens": 50,
+              "completion_tokens": 512,
+              "total_tokens": 562,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "timings": {
+              "cache_n": 0,
+              "prompt_n": 50,
+              "prompt_ms": 825.3,
+              "prompt_per_token_ms": 16.506,
+              "prompt_per_second": 60.6,
+              "predicted_n": 512,
+              "predicted_ms": 13506.8,
+              "predicted_per_token_ms": 26.38,
+              "predicted_per_second": 37.9,
+              "draft_n": 364,
+              "draft_n_accepted": 289
+            },
+            "wallSeconds": 14.633
+          },
+          {
+            "prompt": 2,
+            "usage": {
+              "prompt_tokens": 52,
+              "completion_tokens": 512,
+              "total_tokens": 564,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "timings": {
+              "cache_n": 0,
+              "prompt_n": 52,
+              "prompt_ms": 875.4,
+              "prompt_per_token_ms": 16.835,
+              "prompt_per_second": 59.4,
+              "predicted_n": 512,
+              "predicted_ms": 13459.8,
+              "predicted_per_token_ms": 26.289,
+              "predicted_per_second": 38,
+              "draft_n": 367,
+              "draft_n_accepted": 277
+            },
+            "wallSeconds": 14.61
+          },
+          {
+            "prompt": 3,
+            "usage": {
+              "prompt_tokens": 50,
+              "completion_tokens": 512,
+              "total_tokens": 562,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            },
+            "timings": {
+              "cache_n": 0,
+              "prompt_n": 50,
+              "prompt_ms": 819,
+              "prompt_per_token_ms": 16.38,
+              "prompt_per_second": 61.1,
+              "predicted_n": 512,
+              "predicted_ms": 9919.4,
+              "predicted_per_token_ms": 19.374,
+              "predicted_per_second": 51.6,
+              "draft_n": 387,
+              "draft_n_accepted": 344
+            },
+            "wallSeconds": 11.006
+          }
+        ]
+      }
+    ],
+    "combinedMedian": 40.85,
+    "offeredDraftTokens": 2179,
+    "acceptedDraftTokens": 1772
+  },
+  "previousIq3": {
+    "rates": [
+      64.5,
+      64.7,
+      76.2
+    ],
+    "median": 64.7,
+    "comparison": "Earlier 128k setup; different quantization, GPU cache size, reserve and OS driver. This is a deployment comparison, not an isolated quantization experiment."
+  },
+  "pi": {
+    "provider": "strata",
+    "defaultModel": "Qwen3.8-Flash-Next-UD-IQ4_XS",
+    "capacity": 131072,
+    "thinking": "off",
+    "outputBudget": 8192,
+    "replyPassed": true,
+    "readToolPassed": true,
+    "automaticTunnelReconnectionAfterReboot": true,
+    "authentication": [
+      {
+        "name": "missing",
+        "status": 401
+      },
+      {
+        "name": "invalid",
+        "status": 401
+      },
+      {
+        "name": "valid",
+        "status": 200
+      }
+    ]
+  },
+  "longContext": {
+    "inputTokens": 121553,
+    "outputTokens": 122,
+    "exactFactsPassed": true,
+    "answer": {
+      "amber": "OAK-5827-KITE",
+      "cobalt": "PINE-1946-LANTERN",
+      "silver": "MAPLE-7031-COMPASS"
+    },
+    "wallSeconds": 115.995,
+    "prefillMs": 109418,
+    "prefillTokensPerSecond": 1110.9,
+    "decodeMs": 3351,
+    "decodeTokensPerSecond": 36.4,
+    "acceptedDrafts": 80,
+    "offeredDrafts": 94
+  },
+  "finalState": {
+    "loaded": true,
+    "freeGpuMiB": 476,
+    "availableHostMiB": 15560.84765625
+  },
+  "maintenance": {
+    "unattendedDriverUpdateDetected": true,
+    "earlierRunsExcluded": true,
+    "updaterPausedGracefully": true,
+    "packageAuditClean": true,
+    "rebootCompleted": true,
+    "automaticUpdateTimersRemainEnabled": true
+  },
+  "weights": {
+    "storedOnServer": true,
+    "laptopIq3BackupDeleted": true,
+    "serverIq3WeightsRemoved": true,
+    "rollbackRequiresRedownload": true
+  },
+  "limitations": [
+    "No broad quality comparison or full regression suite.",
+    "Only one long-context retrieval case.",
+    "Three synthetic prompts, two clean repeats; these numbers are not a throughput ceiling."
+  ]
+}
