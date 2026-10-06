@@ -1487,7 +1487,38 @@ bool Verifier::capture(int T, std::string& err) {
         std::fprintf(stderr, "\n");
     }
 #endif
-    const cudaError_t ie = cudaGraphInstantiate(&exec_[T], graph, 0);
+    cudaError_t ie;
+#if !defined(STRATA_USE_HIP) && CUDART_VERSION >= 12000
+    if (std::getenv("STRATA_VERIFY_NODES") != nullptr) {
+        size_t free_before = 0, free_after = 0, total_bytes = 0;
+        const cudaError_t mb = cudaMemGetInfo(&free_before, &total_bytes);
+        cudaGraphInstantiateParams params{};
+        ie = cudaGraphInstantiateWithParams(&exec_[T], graph, &params);
+        const cudaError_t ma = cudaMemGetInfo(&free_after, &total_bytes);
+        std::fprintf(stderr, "[verify-instantiate] T=%d status=%s result=%d error_node=%d "
+                             "free_before_mib=%zu free_after_mib=%zu memory_before=%s memory_after=%s\n",
+                     T, cudaGetErrorString(ie), (int) params.result_out, params.errNode_out != nullptr,
+                     free_before >> 20, free_after >> 20, cudaGetErrorString(mb), cudaGetErrorString(ma));
+        if (params.errNode_out != nullptr) {
+            cudaGraphNodeType type;
+            if (cudaGraphNodeGetType(params.errNode_out, &type) == cudaSuccess && type == cudaGraphNodeTypeKernel) {
+                cudaKernelNodeParams kernel{};
+                if (cudaGraphKernelNodeGetParams(params.errNode_out, &kernel) == cudaSuccess) {
+                    cudaFuncAttributes attr{};
+                    if (cudaFuncGetAttributes(&attr, kernel.func) == cudaSuccess)
+                        std::fprintf(stderr, "[verify-instantiate-node] grid=%u/%u/%u block=%u/%u/%u "
+                                             "dynamic_shared=%u static_shared=%zu local=%zu registers=%d\n",
+                                     kernel.gridDim.x, kernel.gridDim.y, kernel.gridDim.z,
+                                     kernel.blockDim.x, kernel.blockDim.y, kernel.blockDim.z,
+                                     kernel.sharedMemBytes, attr.sharedSizeBytes, attr.localSizeBytes, attr.numRegs);
+                }
+            }
+        }
+    } else
+#endif
+    {
+        ie = cudaGraphInstantiate(&exec_[T], graph, 0);
+    }
     cudaGraphDestroy(graph);
     if (ie != cudaSuccess) {
         err = std::string("verify: instantiate: ") + cudaGetErrorString(ie);

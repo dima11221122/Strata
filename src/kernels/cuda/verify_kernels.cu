@@ -281,6 +281,67 @@ __global__ void fetch_blobs_kernel(const unsigned long long* __restrict__ src, c
     }
 }
 
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+// Exact byte movement through one shared tile; the plan, ownership and stream dependencies stay unchanged.
+__global__ void fetch_blobs_bulk_kernel(const unsigned long long* __restrict__ src, const int32_t* __restrict__ n,
+                                       uint8_t* __restrict__ dst, long long bytes,
+                                       const unsigned long long* __restrict__ destinations, const int32_t* indexed) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    constexpr unsigned TILE_BYTES = 16384;
+    __shared__ __align__(16) uint4 tile[TILE_BYTES / 16];
+    __shared__ __align__(8) unsigned long long barrier;
+    const unsigned barrier_addr = (unsigned) __cvta_generic_to_shared(&barrier);
+    const unsigned tile_addr = (unsigned) __cvta_generic_to_shared(tile);
+    if (threadIdx.x == 0) {
+        asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(barrier_addr) : "memory");
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    }
+    __syncthreads();
+    const bool use_destinations = indexed != nullptr && *indexed == 1;
+    const long long tiles_per_blob = (bytes + TILE_BYTES - 1) / TILE_BYTES;
+    const long long total = (long long) *n * tiles_per_blob;
+    unsigned phase = 0;
+    for (long long i = blockIdx.x; i < total; i += gridDim.x) {
+        const long long k = i / tiles_per_blob;
+        const long long offset = (i - k * tiles_per_blob) * TILE_BYTES;
+        const unsigned size = (unsigned) (bytes - offset < TILE_BYTES ? bytes - offset : TILE_BYTES);
+        const uint8_t* source = (const uint8_t*) src[k] + offset;
+        uint4* target = (uint4*) ((use_destinations ? (uint8_t*) destinations[k] : dst + k * bytes) + offset);
+        if (threadIdx.x == 0) {
+            asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
+                         :: "r"(barrier_addr), "r"(size) : "memory");
+            asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                         :: "r"(tile_addr), "l"(source), "r"(size), "r"(barrier_addr) : "memory");
+            unsigned complete = 0;
+            do {
+                asm volatile("{ .reg .pred ready; mbarrier.try_wait.parity.shared::cta.b64 ready, [%1], %2; "
+                             "selp.b32 %0, 1, 0, ready; }"
+                             : "=r"(complete) : "r"(barrier_addr), "r"(phase) : "memory");
+                if (!complete) __nanosleep(64);
+            } while (!complete);
+        }
+        __syncthreads();  // Publish the completed async copy to every generic-proxy reader.
+        for (unsigned j = threadIdx.x; j < size / 16; j += blockDim.x) target[j] = tile[j];
+        __syncthreads();  // All generic reads finish before the next async overwrite of this tile.
+        phase ^= 1;
+    }
+    if (threadIdx.x == 0)
+        asm volatile("mbarrier.inval.shared::cta.b64 [%0];" :: "r"(barrier_addr) : "memory");
+#else
+    // A mixed-architecture process may select this entry on an older device: retain exact ordinary movement.
+    const bool use_destinations = indexed != nullptr && *indexed == 1;
+    const long long per = bytes / 16, total = (long long) *n * per;
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += (long long) gridDim.x * blockDim.x) {
+        const long long k = i / per, off = i - k * per;
+        uint4* target = use_destinations ? (uint4*) destinations[k] : (uint4*) dst + k * per;
+        target[off] = ((const uint4*) src[k])[off];
+    }
+#endif
+}
+#endif
+
 __global__ void rebase_ptrs_kernel(unsigned long long* ptr, const int32_t* n, unsigned long long base, long long bytes,
                                   const unsigned long long* destinations, const int32_t* indexed) {
     const int k = threadIdx.x;
@@ -369,6 +430,39 @@ void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, 
                  const unsigned long long* destinations, const int32_t* indexed) {
     if (cap <= 0) return;
     if (blob_bytes % 16 != 0) { std::fprintf(stderr, "fetch_blobs: blob size must be a multiple of 16\n"); std::exit(1); }
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+    static const bool bulk = [] {
+        const char* value = std::getenv("STRATA_FETCH_BULK");
+        const bool enabled = value && std::atoi(value) != 0;
+        return enabled;
+    }();
+    if (bulk) {
+        int device = -1;
+        cudaDeviceProp prop{};
+        if (cudaGetDevice(&device) != cudaSuccess || cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
+            std::fprintf(stderr, "fetch_blobs_bulk: device capability query failed\n"); std::exit(1);
+        }
+        if (prop.major >= 9) {
+            cudaFuncAttributes attr{};
+            if (cudaFuncGetAttributes(&attr, fetch_blobs_bulk_kernel) != cudaSuccess) {
+                std::fprintf(stderr, "fetch_blobs_bulk: compiled capability query failed\n"); std::exit(1);
+            }
+            // Older virtual-architecture PTX JIT on a new GPU still contains the ordinary fallback body.
+            if (attr.ptxVersion >= 90 && attr.binaryVersion >= 90) {
+                static const bool announced = [&] {
+                    std::fprintf(stderr, "[fetch-bulk] blocks=16 threads=128 tile_bytes=16384 active=1 "
+                                         "ptx_arch=%d binary_arch=%d\n", attr.ptxVersion, attr.binaryVersion);
+                    return true;
+                }();
+                (void) announced;
+                fetch_blobs_bulk_kernel<<<16, 128, 0, (cudaStream_t) stream>>>(src, n, dst, (long long) blob_bytes,
+                                                                          destinations, indexed);
+                check("fetch_blobs_bulk");
+                return;
+            }
+        }
+    }
+#endif
     static const unsigned blocks = [] {
         // A bounded concurrent-fetch probe: fewer CTAs than this server's 36 SMs.
         // The grid-stride loop still copies every original vector exactly once.
