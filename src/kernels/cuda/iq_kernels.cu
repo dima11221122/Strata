@@ -1385,6 +1385,60 @@ __global__ void __launch_bounds__(256) swiglu_q8_1_entries_kernel(const float* _
     }
 }
 
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+// One complete 32-value Q8_1 block per entry. Keep the native GU row dots
+// and column batches, then publish their results to the existing quantizer.
+__global__ void __launch_bounds__(256) native_iq3_gu_epilogue_kernel(
+    const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
+    const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_tok,
+    const block_q8_1* __restrict__ xq, NativeExpertLayout L, block_q8_1* __restrict__ hq) {
+    const int ng = *n_groups;
+    if (blockIdx.y >= ng) return;
+    __shared__ float res[GRP_NC][64];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r0 = blockIdx.x * 32;
+    const int nb = (int) (L.n_embd / Fmt<21>::qk), xb = (int) (L.n_embd / 32);
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; e += GRP_NC) {
+            const int n = min(GRP_NC, e1 - e);
+            auto pass = [&](auto nc) {
+                constexpr int NC = decltype(nc)::value;
+                int off[NC];
+#pragma unroll
+                for (int c = 0; c < NC; ++c) off[c] = ent_tok[e + min(c, n - 1)] * xb;
+                for (int p = 0; p < 4; ++p) {
+                    const int r = p * 8 + warp;
+                    const uint8_t* gate_row = blob + (size_t) (r0 + r) * L.gu_row;
+                    const uint8_t* up_row = gate_row + L.up_off;
+                    float sg[NC], su[NC];
+                    row_dot_multi<21, NC, (NC < GRP_NC), false>(gate_row, xq, off, n, nb, lane, sg);
+                    row_dot_multi<21, NC, (NC < GRP_NC), false>(up_row, xq, off, n, nb, lane, su);
+#pragma unroll
+                    for (int c = 0; c < NC; ++c) {
+                        if (c < n && lane == c) {
+                            res[c][r] = sg[c];
+                            res[c][32 + r] = su[c];
+                        }
+                    }
+                }
+            };
+            if (n == 1) pass(std::integral_constant<int, 1>{});
+            else if (n == 2) pass(std::integral_constant<int, 2>{});
+            else pass(std::integral_constant<int, GRP_NC>{});
+            __syncthreads();
+            if (warp < n) {
+                const float gate = res[warp][lane];
+                const float h = __fmul_rn(gate / (1.0f + __expf(-gate)), res[warp][32 + lane]);
+                q8_1_store(h, hq, (long long) (e + warp) * L.n_ff + r0 + lane);
+            }
+            __syncthreads(); // Protect shared results before the next batch/group.
+        }
+    }
+}
+#endif
+
 // ---------------------------------------------------------------- dequant (dequantize.cuh)
 template<typename dst_t> __device__ __forceinline__ dst_t cvt(float v);
 template<> __device__ __forceinline__ float cvt<float>(float v) { return v; }
@@ -2672,6 +2726,23 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     }
 #endif
     const dim3 ggu((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) gy);
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+    static const bool gu_epilogue = env_on("STRATA_IQ3_GU_EPILOGUE");
+    static const bool expert_mma = env_on("STRATA_IQ_EXPERT_MMA");
+    const bool cuda_fused_gu = gu_epilogue && !expert_mma && !v1 && !g_old_kernels &&
+                              (!g_stage_grid || !g_stage_iq3) && L.gu_type == 21 && L.d_type == 20 &&
+                              L.n_embd == 2560 && L.n_ff == 640;
+    if (cuda_fused_gu && g_exp_phase != 2) {
+        const dim3 grid((unsigned) (L.n_ff / 32), (unsigned) gy);
+        native_iq3_gu_epilogue_kernel<<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq);
+        check("native_expert_grouped/gu epilogue");
+        static const bool logged = [] {
+            std::fprintf(stderr, "[iq3-gu-epilogue] rows=32 columns=4 active=1\n");
+            return true;
+        }();
+        (void) logged;
+    }
+#endif
 #if defined(STRATA_HIP_GFX906)
     const int em0 = exp_mode();
 #endif
@@ -2690,6 +2761,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         check("native_expert_grouped/gu fused");
     }
     if (g_exp_phase != 2 && !fused_gu) {
+#elif defined(__CUDACC__) && !defined(__HIPCC__)
+    if (g_exp_phase != 2 && !cuda_fused_gu) {
 #else
     if (g_exp_phase != 2) {
 #endif
