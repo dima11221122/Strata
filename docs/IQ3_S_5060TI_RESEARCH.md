@@ -494,6 +494,12 @@ The combined indexed-head/mixed-draft trial terminated at allocation preflight o
 
 The [primary llama.cpp tiled source](https://github.com/ggml-org/llama.cpp/blob/50569eb87df530daff11afda229ceb9ab8e6cae8/ggml/src/ggml-cpu/tiled/tiled.cpp) supports canonical IQ3_S, but its profitability gate is at least eight inputs per expert. The retained verifier has at most six total inputs; expert groups are often smaller. Its large-batch path is therefore not imported or forced based on prompt-processing speedups.
 
+### Existing HC staging basic comparison
+
+A read-only analysis of the saved retained trace isolated5,311 complete dense spans across113 decode windows, from the preceding combine to routing in layers1–47. Within that scope, HC down/up envelopes were2.264/1.806ms/window. This excludes inter-window draft/commit work and layer0; profiled envelopes are not predicted recoverable time.
+
+The untried upstream `STRATA_HC_SPLIT=1` path keeps the split norm and original ordered row dots, replacing eight asynchronously staged1280-element down tiles with four2560-element tiles. A fresh basic bracket completed October6 at04:08UTC on validated3378. Controls67.9/66.9/68.4 and63.8/65.0/66.9 bracketed candidate65.3/65.6/67.5tokens/s. Warm means67.65/66.55/65.95 fail the fixed gain gate. Startup logs confirmed staged/split/staged;4601slots/8.77GiB,40525 draft rows and527/439MiB ready/post-generation free were preserved. Corresponding answers and aggregate draft counts matched, without establishing identical ordered work. The override stays off; no full benchmark, new profiling or regression followed. Validated IQ3_S/auth/Pi65536 were restored. The147-report full ledger and unmet90tokens/s target are unchanged.
+
 ### Earlier validation
 
 The initial CUDA 13, SM 120 build completed. Of 75 registered CTest cases, 73 passed. `ple_parity` lacked its relative Q2_0 GGUF fixture; `expert_multi_test` requires AVX-512 VNNI/VBMI unavailable on this EPYC. These two failures are reported rather than hidden. The IQ3_S runtime uses the supported AVX2 path.
