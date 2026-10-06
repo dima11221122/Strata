@@ -283,19 +283,27 @@ __global__ void fetch_blobs_kernel(const unsigned long long* __restrict__ src, c
 
 #if defined(__CUDACC__) && !defined(__HIPCC__)
 // Exact byte movement through one shared tile; the plan, ownership and stream dependencies stay unchanged.
-__global__ void fetch_blobs_bulk_kernel(const unsigned long long* __restrict__ src, const int32_t* __restrict__ n,
+template <bool BULK>
+__global__ void fetch_blobs_async_kernel(const unsigned long long* __restrict__ src, const int32_t* __restrict__ n,
                                        uint8_t* __restrict__ dst, long long bytes,
                                        const unsigned long long* __restrict__ destinations, const int32_t* indexed) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if __CUDA_ARCH__ >= 900
+    constexpr bool use_bulk = BULK;
+#else
+    constexpr bool use_bulk = false;
+#endif
     constexpr unsigned TILE_BYTES = 16384;
     __shared__ __align__(16) uint4 tile[TILE_BYTES / 16];
     __shared__ __align__(8) unsigned long long barrier;
     const unsigned barrier_addr = (unsigned) __cvta_generic_to_shared(&barrier);
     const unsigned tile_addr = (unsigned) __cvta_generic_to_shared(tile);
-    if (threadIdx.x == 0) {
-        asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(barrier_addr) : "memory");
-        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    if constexpr (use_bulk) {
+        if (threadIdx.x == 0) {
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(barrier_addr) : "memory");
+            asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        }
     }
     __syncthreads();
     const bool use_destinations = indexed != nullptr && *indexed == 1;
@@ -308,26 +316,38 @@ __global__ void fetch_blobs_bulk_kernel(const unsigned long long* __restrict__ s
         const unsigned size = (unsigned) (bytes - offset < TILE_BYTES ? bytes - offset : TILE_BYTES);
         const uint8_t* source = (const uint8_t*) src[k] + offset;
         uint4* target = (uint4*) ((use_destinations ? (uint8_t*) destinations[k] : dst + k * bytes) + offset);
-        if (threadIdx.x == 0) {
-            asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
-                         :: "r"(barrier_addr), "r"(size) : "memory");
-            asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
-                         :: "r"(tile_addr), "l"(source), "r"(size), "r"(barrier_addr) : "memory");
-            unsigned complete = 0;
-            do {
-                asm volatile("{ .reg .pred ready; mbarrier.try_wait.parity.shared::cta.b64 ready, [%1], %2; "
-                             "selp.b32 %0, 1, 0, ready; }"
-                             : "=r"(complete) : "r"(barrier_addr), "r"(phase) : "memory");
-                if (!complete) __nanosleep(64);
-            } while (!complete);
+        if constexpr (use_bulk) {
+            if (threadIdx.x == 0) {
+                asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
+                             :: "r"(barrier_addr), "r"(size) : "memory");
+                asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                             :: "r"(tile_addr), "l"(source), "r"(size), "r"(barrier_addr) : "memory");
+                unsigned complete = 0;
+                do {
+                    asm volatile("{ .reg .pred ready; mbarrier.try_wait.parity.shared::cta.b64 ready, [%1], %2; "
+                                 "selp.b32 %0, 1, 0, ready; }"
+                                 : "=r"(complete) : "r"(barrier_addr), "r"(phase) : "memory");
+                    if (!complete) __nanosleep(64);
+                } while (!complete);
+            }
+        } else {
+            for (unsigned j = threadIdx.x; j < size / 16; j += blockDim.x) {
+                const unsigned address = tile_addr + j * 16;
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+                             :: "r"(address), "l"(source + j * 16) : "memory");
+            }
+            asm volatile("cp.async.commit_group;" ::: "memory");
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
         }
         __syncthreads();  // Publish the completed async copy to every generic-proxy reader.
         for (unsigned j = threadIdx.x; j < size / 16; j += blockDim.x) target[j] = tile[j];
         __syncthreads();  // All generic reads finish before the next async overwrite of this tile.
-        phase ^= 1;
+        if constexpr (use_bulk) phase ^= 1;
     }
-    if (threadIdx.x == 0)
-        asm volatile("mbarrier.inval.shared::cta.b64 [%0];" :: "r"(barrier_addr) : "memory");
+    if constexpr (use_bulk) {
+        if (threadIdx.x == 0)
+            asm volatile("mbarrier.inval.shared::cta.b64 [%0];" :: "r"(barrier_addr) : "memory");
+    }
 #else
     // A mixed-architecture process may select this entry on an older device: retain exact ordinary movement.
     const bool use_destinations = indexed != nullptr && *indexed == 1;
@@ -436,28 +456,43 @@ void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, 
         const bool enabled = value && std::atoi(value) != 0;
         return enabled;
     }();
-    if (bulk) {
+    static const bool async = [] {
+        const char* value = std::getenv("STRATA_FETCH_ASYNC");
+        return value && std::atoi(value) != 0;
+    }();
+    if (bulk && async) {
+        std::fprintf(stderr, "fetch_blobs: bulk and ordinary async probes are mutually exclusive\n"); std::exit(1);
+    }
+    if (bulk || async) {
+        const int minimum_arch = bulk ? 90 : 80;
         int device = -1;
         cudaDeviceProp prop{};
         if (cudaGetDevice(&device) != cudaSuccess || cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
-            std::fprintf(stderr, "fetch_blobs_bulk: device capability query failed\n"); std::exit(1);
+            std::fprintf(stderr, "fetch_blobs: device capability query failed\n"); std::exit(1);
         }
-        if (prop.major >= 9) {
+        if (prop.major * 10 + prop.minor >= minimum_arch) {
             cudaFuncAttributes attr{};
-            if (cudaFuncGetAttributes(&attr, fetch_blobs_bulk_kernel) != cudaSuccess) {
-                std::fprintf(stderr, "fetch_blobs_bulk: compiled capability query failed\n"); std::exit(1);
+            const cudaError_t status = bulk ? cudaFuncGetAttributes(&attr, fetch_blobs_async_kernel<true>)
+                                           : cudaFuncGetAttributes(&attr, fetch_blobs_async_kernel<false>);
+            if (status != cudaSuccess) {
+                std::fprintf(stderr, "fetch_blobs: compiled capability query failed\n"); std::exit(1);
             }
-            // Older virtual-architecture PTX JIT on a new GPU still contains the ordinary fallback body.
-            if (attr.ptxVersion >= 90 && attr.binaryVersion >= 90) {
+            // A lower-architecture PTX image cannot establish the selected instruction mechanism.
+            if (attr.ptxVersion >= minimum_arch && attr.binaryVersion >= minimum_arch) {
                 static const bool announced = [&] {
-                    std::fprintf(stderr, "[fetch-bulk] blocks=16 threads=128 tile_bytes=16384 active=1 "
-                                         "ptx_arch=%d binary_arch=%d\n", attr.ptxVersion, attr.binaryVersion);
+                    std::fprintf(stderr, "[fetch-%s] blocks=16 threads=128 tile_bytes=16384 active=1 "
+                                         "ptx_arch=%d binary_arch=%d\n", bulk ? "bulk" : "async",
+                                 attr.ptxVersion, attr.binaryVersion);
                     return true;
                 }();
                 (void) announced;
-                fetch_blobs_bulk_kernel<<<16, 128, 0, (cudaStream_t) stream>>>(src, n, dst, (long long) blob_bytes,
-                                                                          destinations, indexed);
-                check("fetch_blobs_bulk");
+                if (bulk)
+                    fetch_blobs_async_kernel<true><<<16, 128, 0, (cudaStream_t) stream>>>(src, n, dst, (long long) blob_bytes,
+                                                                                     destinations, indexed);
+                else
+                    fetch_blobs_async_kernel<false><<<16, 128, 0, (cudaStream_t) stream>>>(src, n, dst, (long long) blob_bytes,
+                                                                                      destinations, indexed);
+                check(bulk ? "fetch_blobs_bulk" : "fetch_blobs_async");
                 return;
             }
         }
