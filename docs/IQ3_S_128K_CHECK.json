@@ -1,0 +1,316 @@
+{
+  "checkedAt": "2026-10-06T04:59:54.265Z",
+  "contextCapacity": 131072,
+  "engineSha256": "3378aa4130f6a3fa4e5ff446f5c43809f9d434b0fed33fb652a41103b625c3a7",
+  "model": "Qwen3.8-Flash-Next-IQ3_S",
+  "source": "actual Pi 1.0.2 on the local laptop through the SSH tunnel",
+  "setup": {
+    "workers": 20,
+    "q6Rowwarp": true,
+    "fetchOverlap": true,
+    "pcieFraction": 0.2,
+    "draftCap": 4,
+    "verifierCapacity": 6,
+    "confidenceFloor": 0.7,
+    "draftVocabularyRows": 40525,
+    "drafter": "canonical Q2 MTP",
+    "kvType": "int8",
+    "residentKvCells": 32768,
+    "nativeExpertSlots": 4601,
+    "expertCacheGiB": 8.77,
+    "configuredReserveMiB": 700
+  },
+  "piChecks": {
+    "smoke": {
+      "mode": "smoke",
+      "started": "2026-10-06T04:47:32.086Z",
+      "completed": "2026-10-06T04:47:35.291Z",
+      "exitCode": 0,
+      "passed": true,
+      "answer": "PI_STRATA_OK_128K",
+      "usage": {
+        "input": 179,
+        "output": 48,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "reasoning": 0,
+        "totalTokens": 227,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "stopReason": "stop",
+      "elapsedSeconds": 3.205,
+      "toolEvents": []
+    },
+    "readTool": {
+      "mode": "tool",
+      "started": "2026-10-06T04:59:04.516Z",
+      "completed": "2026-10-06T04:59:10.079Z",
+      "exitCode": 0,
+      "passed": true,
+      "answer": "PI_READ_TOOL_OK_128K",
+      "usage": {
+        "input": 23,
+        "output": 22,
+        "cacheRead": 681,
+        "cacheWrite": 0,
+        "reasoning": 0,
+        "totalTokens": 726,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "stopReason": "stop",
+      "elapsedSeconds": 5.563,
+      "toolEvents": [
+        {
+          "toolName": "read",
+          "isError": false
+        }
+      ]
+    },
+    "longRetrieval": {
+      "mode": "long",
+      "started": "2026-10-06T04:57:19.227Z",
+      "completed": "2026-10-06T04:58:49.723Z",
+      "exitCode": 0,
+      "passed": true,
+      "answer": "{\n  \"amber\": \"OAK-5827-KITE\",\n  \"cobalt\": \"PINE-1946-LANTERN\",\n  \"silver\": \"MAPLE-7031-COMPASS\"\n}",
+      "usage": {
+        "input": 121551,
+        "output": 170,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "reasoning": 0,
+        "totalTokens": 121721,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "stopReason": "stop",
+      "elapsedSeconds": 90.496,
+      "toolEvents": [],
+      "engineTimings": {
+        "prefillMs": 82803,
+        "generatedTokens": 170,
+        "decodeMs": 3119,
+        "decodeTokensPerSecond": 54.5
+      }
+    }
+  },
+  "shortBenchmark": {
+    "started": "2026-10-06T04:48:41.654Z",
+    "completed": "2026-10-06T04:49:06.679Z",
+    "contextCapacity": 131072,
+    "source": "local laptop through SSH tunnel",
+    "rates": [
+      66.5,
+      66.2,
+      76.2
+    ],
+    "median": 66.5,
+    "results": [
+      {
+        "prompt": 1,
+        "usage": {
+          "prompt_tokens": 50,
+          "completion_tokens": 512,
+          "total_tokens": 562,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 50,
+          "prompt_ms": 675.5,
+          "prompt_per_token_ms": 13.51,
+          "prompt_per_second": 74,
+          "predicted_n": 512,
+          "predicted_ms": 7694.6,
+          "predicted_per_token_ms": 15.029,
+          "predicted_per_second": 66.5,
+          "draft_n": 359,
+          "draft_n_accepted": 293
+        },
+        "wallSeconds": 8.613
+      },
+      {
+        "prompt": 2,
+        "usage": {
+          "prompt_tokens": 52,
+          "completion_tokens": 512,
+          "total_tokens": 564,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 52,
+          "prompt_ms": 695.9,
+          "prompt_per_token_ms": 13.383,
+          "prompt_per_second": 74.7,
+          "predicted_n": 512,
+          "predicted_ms": 7735,
+          "predicted_per_token_ms": 15.107,
+          "predicted_per_second": 66.2,
+          "draft_n": 358,
+          "draft_n_accepted": 287
+        },
+        "wallSeconds": 8.645
+      },
+      {
+        "prompt": 3,
+        "usage": {
+          "prompt_tokens": 50,
+          "completion_tokens": 512,
+          "total_tokens": 562,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 50,
+          "prompt_ms": 824.8,
+          "prompt_per_token_ms": 16.496,
+          "prompt_per_second": 60.6,
+          "predicted_n": 512,
+          "predicted_ms": 6720.9,
+          "predicted_per_token_ms": 13.127,
+          "predicted_per_second": 76.2,
+          "draft_n": 400,
+          "draft_n_accepted": 339
+        },
+        "wallSeconds": 7.765
+      }
+    ]
+  },
+  "authentication": {
+    "checkedAt": "2026-10-06T04:58:23.025Z",
+    "statuses": [
+      {
+        "name": "missing",
+        "status": 401
+      },
+      {
+        "name": "invalid",
+        "status": 401
+      },
+      {
+        "name": "valid",
+        "status": 200
+      }
+    ],
+    "pi": {
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "models": [
+        {
+          "id": "Qwen3.8-Flash-Next-IQ3_S",
+          "contextWindow": 131072,
+          "maxTokens": 8192,
+          "samplingParams": {
+            "max_tokens": 8192
+          }
+        }
+      ],
+      "defaultProvider": "strata",
+      "defaultModel": "Qwen3.8-Flash-Next-IQ3_S",
+      "thinking": "off"
+    }
+  },
+  "outputBudgetIssue": {
+    "initial": {
+      "mode": "long",
+      "started": "2026-10-06T04:49:29.014Z",
+      "completed": "2026-10-06T04:52:20.808Z",
+      "exitCode": 0,
+      "passed": false,
+      "answer": "",
+      "usage": {
+        "input": 121551,
+        "output": 1,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "reasoning": 0,
+        "totalTokens": 121552,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "stopReason": "length",
+      "elapsedSeconds": 171.794,
+      "toolEvents": []
+    },
+    "promptChars": 536453,
+    "piEstimatedPromptTokens": 134114,
+    "actualPromptTokens": 121551,
+    "cause": "Pi character-based input estimate clamped max_tokens to 1",
+    "fix": "Strata model samplingParams.max_tokens=8192; real contextWindow remains 131072. Strata enforces the actual tokenizer input-plus-output limit."
+  },
+  "server": {
+    "checkedAt": "2026-10-06T04:59:54.370Z",
+    "health": {
+      "status": 200,
+      "loaded": true
+    },
+    "state": [
+      "Result=success",
+      "ActiveState=active",
+      "SubState=running"
+    ],
+    "selected": {
+      "--expert-cache": "3538",
+      "--prefill": "auto",
+      "--spec": "4",
+      "--max-context": "131072",
+      "--kv": "int8",
+      "--kv-resident": "32768",
+      "--pcie-frac": "0.20",
+      "--spec-min-p": "0.70",
+      "--pool-workers": "20",
+      "--vram-reserve-mib": "700"
+    },
+    "liveEngineHashes": [
+      "3378aa4130f6a3fa4e5ff446f5c43809f9d434b0fed33fb652a41103b625c3a7"
+    ],
+    "postCheckFreeGpuMiB": 255,
+    "historicalFreeGpuFloorMiB": 256,
+    "meetsHistoricalFreeGpuFloor": false,
+    "hostAvailableMiB": 18640.5546875,
+    "startup": [
+      "strata generate: KV streaming: 32768 of 131072 cells per QSA layer in VRAM, the K/V in 1.55 GiB of pinned RAM",
+      "strata generate: expert cache 4601 slots, 8.77 GiB of VRAM; policy is",
+      "strata generate: pre-filled 4601 of 4601 slots from the profile; slot 0 verified",
+      "strata generate: R4 hit path ON - resident experts are computed on the GPU",
+      "strata generate: token graph hit path: 4601 resident experts, decided on the device",
+      "strata mtp: draft head over 40525 tokens (81.2 MiB)"
+    ],
+    "longRequestLog": "strata serve: prompt 121551 tokens = 0 reused + 121551 read in 82803 ms (1468.0 tok/s), 170 generated in 3119 ms (54.5 tok/s), drafts accepted 110 of 128, 6 checkpoints"
+  },
+  "limitations": [
+    "Short benchmark is one fresh check, not a repeated comparison against 65536 capacity.",
+    "Long retrieval uses 121551 actual input tokens; it does not fill every one of the 131072 cells.",
+    "Post-check free GPU memory is 255 MiB, 1 MiB below the earlier 256 MiB trial floor; no OOM occurred, but deployment headroom is tight.",
+    "No broad long-context quality suite or concurrent serving test was run.",
+    "90 tokens/s remains unmet."
+  ]
+}
