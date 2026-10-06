@@ -1754,10 +1754,193 @@ void launch_mmvq(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int
     }
 }
 
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+template<int TY> struct ExpertMmaWeights;
+
+template<> struct ExpertMmaWeights<21> {
+    static constexpr int grid_size = 512;
+    __device__ static uint32_t grid_value(int i) { return iq3s_grid[i]; }
+    __device__ static uint32_t word(const uint8_t* row, int part, int quad, const uint32_t* grid) {
+        const block_iq3_s& b = ((const block_iq3_s*) row)[part / 8];
+        const int sub = part & 7;
+        const int code = b.qs[sub * 8 + quad] | (((b.qh[sub] >> quad) & 1) << 8);
+        const unsigned signs = (b.signs[sub * 4 + quad / 2] >> (4 * (quad & 1))) & 15u;
+        const unsigned bits = (signs * 0x204081u) & 0x01010101u;
+        const int mask = (int) ((bits << 8) - bits);
+        return (uint32_t) __vsub4((int) grid[code] ^ mask, mask);
+    }
+    __device__ static void scale(const uint8_t* row, int part, float& d, uint8_t& factor) {
+        const block_iq3_s& b = ((const block_iq3_s*) row)[part / 8];
+        const int sub = part & 7;
+        d = __half2float(b.d);
+        factor = (uint8_t) (1 + 2 * ((b.scales[sub / 2] >> (4 * (sub & 1))) & 15));
+    }
+};
+
+template<> struct ExpertMmaWeights<20> {
+    static constexpr int grid_size = 16;
+    __device__ static uint32_t grid_value(int i) { return (uint32_t) (int) kvalues_iq4nl[i]; }
+    __device__ static uint32_t word(const uint8_t* row, int part, int quad, const uint32_t* grid) {
+        const block_iq4_nl& b = ((const block_iq4_nl*) row)[part];
+        uint32_t value = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int code = (b.qs[(quad & 3) * 4 + j] >> (quad >= 4 ? 4 : 0)) & 15;
+            value |= (uint32_t) (uint8_t) grid[code] << (8 * j);
+        }
+        return value;
+    }
+    __device__ static void scale(const uint8_t* row, int part, float& d, uint8_t& factor) {
+        d = __half2float(((const block_iq4_nl*) row)[part].d);
+        factor = 1;
+    }
+};
+
+template<bool GU>
+__device__ __forceinline__ const uint8_t* expert_mma_row(const uint8_t* blob, int row, NativeExpertLayout L) {
+    if constexpr (GU)
+        return blob + (row >= L.n_ff ? L.up_off : 0) + (size_t) (row >= L.n_ff ? row - L.n_ff : row) * L.gu_row;
+    else
+        return blob + L.down_off + (size_t) row * L.d_row;
+}
+
+// Canonical weights are decoded only into a temporary tile. Each 32-value dot keeps its own quantization scale.
+template<int TY, bool GU>
+__global__ void __launch_bounds__(128) native_expert_mma_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                              const int32_t* __restrict__ grp_start,
+                                                              const int32_t* __restrict__ n_groups,
+                                                              const int32_t* __restrict__ mapping,
+                                                              const block_q8_1* __restrict__ input, NativeExpertLayout L,
+                                                              float* __restrict__ first, float* __restrict__ second) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    using W = ExpertMmaWeights<TY>;
+    constexpr int ROW_WORDS = 68;  // Four padding words make the fragment reads use all 32 shared-memory banks.
+    __shared__ __align__(16) uint32_t weights[16 * ROW_WORDS];
+    __shared__ uint32_t grid[W::grid_size];
+    __shared__ float scales[16 * 8];
+    __shared__ uint8_t factors[16 * 8];
+    __shared__ float partials[4 * 32 * 4];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int group_lane = lane >> 2, quad_lane = lane & 3;
+    const int row_base = (int) blockIdx.x * 16;
+    const int rows = GU ? 2 * (int) L.n_ff : (int) L.n_embd;
+    const int parts = (int) ((GU ? L.n_embd : L.n_ff) / 32);
+    const int ng = *n_groups;
+    if ((int) blockIdx.y >= ng || row_base >= rows) return;
+    for (int i = tid; i < W::grid_size; i += 128) grid[i] = W::grid_value(i);
+    __syncthreads();
+    for (int g = (int) blockIdx.y; g < ng; g += (int) gridDim.y) {
+        const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+        const int begin = grp_start[g], end = grp_start[g + 1];
+        for (int entry = begin; entry < end; entry += 8) {
+            const int columns = min(8, end - entry);
+            float sum[4] = {0, 0, 0, 0};
+            for (int base = 0; base < parts; base += 8) {
+                for (int i = tid; i < 16 * 64; i += 128) {
+                    const int r = i / 64, p = (i % 64) / 8, q = i & 7;
+                    uint32_t value = 0;
+                    if (row_base + r < rows && base + p < parts)
+                        value = W::word(expert_mma_row<GU>(blob, row_base + r, L), base + p, q, grid);
+                    weights[r * ROW_WORDS + i % 64] = value;
+                }
+                const int scale_row = tid / 8, scale_part = tid & 7;
+                float d = 0;
+                uint8_t factor = 0;
+                if (row_base + scale_row < rows && base + scale_part < parts)
+                    W::scale(expert_mma_row<GU>(blob, row_base + scale_row, L), base + scale_part, d, factor);
+                scales[tid] = d;
+                factors[tid] = factor;
+                __syncthreads();
+                for (int p = warp; p < 8 && base + p < parts; p += 4) {
+                    const int offset = p * 8 + quad_lane;
+                    const uint32_t a0 = weights[group_lane * ROW_WORDS + offset];
+                    const uint32_t a1 = weights[(group_lane + 8) * ROW_WORDS + offset];
+                    const uint32_t a2 = weights[group_lane * ROW_WORDS + offset + 4];
+                    const uint32_t a3 = weights[(group_lane + 8) * ROW_WORDS + offset + 4];
+                    uint32_t b0 = 0, b1 = 0;
+                    if (group_lane < columns) {
+                        const int input_entry = GU ? mapping[entry + group_lane] : entry + group_lane;
+                        const block_q8_1& x = input[(size_t) input_entry * parts + base + p];
+                        b0 = (uint32_t) get_int_b4(x.qs, quad_lane);
+                        b1 = (uint32_t) get_int_b4(x.qs, quad_lane + 4);
+                    }
+                    int dot[4] = {0, 0, 0, 0};
+                    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                                 : "+r"(dot[0]), "+r"(dot[1]), "+r"(dot[2]), "+r"(dot[3])
+                                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const int c = 2 * quad_lane + (i & 1), r = group_lane + (i >= 2 ? 8 : 0);
+                        if (c < columns && row_base + r < rows) {
+                            const int input_entry = GU ? mapping[entry + c] : entry + c;
+                            const float xd = __low2float(input[(size_t) input_entry * parts + base + p].ds);
+                            const int scaled_dot = dot[i] * (int) factors[r * 8 + p];
+                            sum[i] += (scales[r * 8 + p] * xd) * scaled_dot;
+                        }
+                    }
+                }
+                __syncthreads();  // All fragment and scale reads finish before tile reuse.
+            }
+#pragma unroll
+            for (int i = 0; i < 4; ++i) partials[warp * 128 + lane * 4 + i] = sum[i];
+            __syncthreads();
+            if (warp == 0) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int c = 2 * quad_lane + (i & 1), row = row_base + group_lane + (i >= 2 ? 8 : 0);
+                    if (c < columns && row < rows) {
+                        const int offset = lane * 4 + i;
+                        const float value = ((partials[offset] + partials[128 + offset]) + partials[256 + offset])
+                                            + partials[384 + offset];
+                        if constexpr (GU) {
+                            const bool is_up = row >= L.n_ff;
+                            (is_up ? second : first)[(size_t) (entry + c) * L.n_ff + (is_up ? row - L.n_ff : row)] = value;
+                        } else {
+                            first[(size_t) mapping[entry + c] * L.n_embd + row] = value;
+                        }
+                    }
+                }
+            }
+            __syncthreads();  // Protect partial storage before the next entry batch or group.
+        }
+    }
+#endif
+}
+
+template<bool GU>
+bool launch_expert_mma(dim3 grid, cudaStream_t stream, const unsigned long long* grp_ptr,
+                       const int32_t* grp_start, const int32_t* n_groups, const int32_t* mapping,
+                       const block_q8_1* input, const NativeExpertLayout& L, float* first, float* second) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_IQ_EXPERT_MMA");
+        return value && std::atoi(value) != 0;
+    }();
+    if (!enabled || g_old_kernels || L.n_embd != 2560 || L.n_ff != 640) return false;
+    constexpr int type = GU ? 21 : 20;
+    cudaFuncAttributes attr{};
+    if (cudaFuncGetAttributes(&attr, native_expert_mma_kernel<type, GU>) != cudaSuccess ||
+        attr.ptxVersion < 80 || attr.binaryVersion < 80) return false;
+    static const bool announced = [&] {
+        std::fprintf(stderr, "[iq-expert-mma] role=%s type=%d rows=16 columns=8 tile_k=256 active=1 "
+                             "ptx_arch=%d binary_arch=%d\n", GU ? "gu" : "down", type, attr.ptxVersion, attr.binaryVersion);
+        return true;
+    }();
+    (void) announced;
+    grid.x = (unsigned) (((GU ? 2 * L.n_ff : L.n_embd) + 15) / 16);
+    native_expert_mma_kernel<type, GU><<<grid, 128, 0, stream>>>(grp_ptr, grp_start, n_groups, mapping, input, L, first, second);
+    return true;
+}
+#endif
+
 template<int TG>
 void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L,
                float* gate, float* up) {
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+    if constexpr (TG == 21)
+        if (launch_expert_mma<true>(grid, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up)) return;
+#endif
     if constexpr (!kSplit<TG>) native_gu_kernel<TG><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
     else if (g_old_kernels) native_gu_kernel<TG><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
     else if constexpr (kStageIqGrid<TG>) {
@@ -1773,6 +1956,10 @@ template<int TD>
 void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                  const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L,
                  float* out) {
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+    if constexpr (TD == 20)
+        if (launch_expert_mma<false>(grid, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, nullptr)) return;
+#endif
     if constexpr (!kSplit<TD>) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else if (g_old_kernels) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else native_down_multi_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
